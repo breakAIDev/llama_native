@@ -44,7 +44,6 @@ lcov-report/
 
 tags
 .build/
-build*
 release
 debug
 !build-info.cmake
