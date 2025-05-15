@@ -28,7 +28,7 @@ else()
     if (MINGW)
         set(BUILD_SHARED_LIBS_DEFAULT OFF)
     else()
-        set(BUILD_SHARED_LIBS_DEFAULT ON)
+        set(BUILD_SHARED_LIBS_DEFAULT OFF)
     endif()
 endif()
 
