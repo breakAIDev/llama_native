@@ -272,6 +272,10 @@ set(GGML_PUBLIC_HEADERS
     include/gguf.h)
 
 set_target_properties(ggml PROPERTIES PUBLIC_HEADER "${GGML_PUBLIC_HEADERS}")
+set_target_properties(ggml PROPERTIES
+    VERSION 1.0.0
+    SOVERSION 1
+)
 #if (GGML_METAL)
 #    set_target_properties(ggml PROPERTIES RESOURCE "${CMAKE_CURRENT_SOURCE_DIR}/src/ggml-metal.metal")
 #endif()
