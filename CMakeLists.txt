@@ -29,7 +29,7 @@ else()
     set(LLAMA_STANDALONE OFF)
 endif()
 
-option(LLAMA_USE_SYSTEM_GGML "Use system libggml" ON)
+option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
 
 if (EMSCRIPTEN)
     set(BUILD_SHARED_LIBS_DEFAULT OFF)
