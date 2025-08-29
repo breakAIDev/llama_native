@@ -1,79 +1,75 @@
 cmake_minimum_required(VERSION 3.13)
-project(llama_cli CXX)
+project(llama_cli LANGUAGES C CXX)
 
-include(GNUInstallDirs)
-
-# Turn this OFF to build the classic keyboard-only CLI
-option(WITH_VOICE_IO "Enable mic STT (Vosk+PortAudio) and TTS (eSpeak NG)" ON)
+# Options
+option(WITH_VOICE_IO "Enable voice STT/TTS (Vosk + PortAudio + eSpeak)" ON)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+include(GNUInstallDirs)
 find_package(Threads REQUIRED)
 
-# Your existing target
+# llama.cpp exports targets "llama" and "common" at top-level.
+# Ensure this CMakeLists is added from within the same build (recommended).
+# If building standalone, add a find_package(llama CONFIG REQUIRED) here instead.
+#
+# add_executable target
 set(TARGET llama-cli)
 add_executable(${TARGET} main.cpp)
-target_compile_features(${TARGET} PRIVATE cxx_std_17)
 
-# Link to llama.cpp's libs as you already do
-target_link_libraries(${TARGET} PRIVATE common llama Threads::Threads)
+# Always link the core llama.cpp bits
+target_link_libraries(${TARGET} PRIVATE
+    llama
+    common
+    Threads::Threads
+)
 
-# ---- Optional Voice I/O (STT+TTS) -------------------------------------------
+# -------------------------
+# Optional Voice I/O block:
+# -------------------------
 if (WITH_VOICE_IO)
+  message(STATUS "Voice I/O enabled: looking for PortAudio, Vosk, and eSpeak")
+
+  # Prefer pkg-config for PortAudio
   find_package(PkgConfig REQUIRED)
-
-  # PortAudio & eSpeak-NG are exposed via pkg-config on Yocto
   pkg_check_modules(PORTAUDIO REQUIRED portaudio-2.0)
-  pkg_check_modules(ESPEAKNG REQUIRED espeak-ng)
+  target_include_directories(${TARGET} PRIVATE ${PORTAUDIO_INCLUDE_DIRS})
+  target_link_libraries(${TARGET} PRIVATE ${PORTAUDIO_LIBRARIES})
 
-  # Vosk doesn't always ship a .pc file; find it the old-fashioned way
-  # (Yocto sysroot paths are honored via CMAKE_FIND_ROOT_PATH)
+  # Vosk (no pkg-config expected) – find headers + lib directly
+  # Your stt.bb installs:   ${includedir}/vosk_api.h   and   ${libdir}/libvosk.so
   find_path(VOSK_INCLUDE_DIR
     NAMES vosk_api.h
-    HINTS ENV VOSK_INCLUDE_DIR
-    PATHS
-      ${CMAKE_FIND_ROOT_PATH}/usr/include
-      /usr/include
-      /usr/local/include
+    PATH_SUFFIXES .
+    PATHS /usr/include
   )
-  find_library(VOSK_LIB
-    NAMES vosk
-    HINTS ENV VOSK_LIB
-    PATHS
-      ${CMAKE_FIND_ROOT_PATH}/usr/lib ${CMAKE_FIND_ROOT_PATH}/usr/lib64
-      /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64
-  )
+  find_library(VOSK_LIBRARY NAMES vosk)
 
-  if (NOT VOSK_INCLUDE_DIR OR NOT VOSK_LIB)
-    message(FATAL_ERROR "WITH_VOICE_IO=ON but Vosk not found. Provide -DVOSK_INCLUDE_DIR=... and -DVOSK_LIB=...")
+  if (NOT VOSK_INCLUDE_DIR OR NOT VOSK_LIBRARY)
+    message(FATAL_ERROR "Vosk not found: set VOSK_INCLUDE_DIR and VOSK_LIBRARY or install stt (vosk-api) properly")
   endif()
 
-  target_compile_definitions(${TARGET} PRIVATE WITH_VOICE_IO)
+  target_include_directories(${TARGET} PRIVATE ${VOSK_INCLUDE_DIR})
+  target_link_libraries(${TARGET} PRIVATE ${VOSK_LIBRARY})
 
-  target_include_directories(${TARGET} PRIVATE
-    ${PORTAUDIO_INCLUDE_DIRS}
-    ${ESPEAKNG_INCLUDE_DIRS}
-    ${VOSK_INCLUDE_DIR}
-  )
-
-  target_link_libraries(${TARGET} PRIVATE
-    ${PORTAUDIO_LIBRARIES}
-    ${ESPEAKNG_LIBRARIES}
-    ${VOSK_LIB}
-  )
-
-  # Honor any extra flags pkg-config wants (usually empty on Yocto, but safe)
-  target_compile_options(${TARGET} PRIVATE
-    ${PORTAUDIO_CFLAGS_OTHER}
-    ${ESPEAKNG_CFLAGS_OTHER}
-  )
-  target_link_options(${TARGET} PRIVATE
-    ${PORTAUDIO_LDFLAGS_OTHER}
-    ${ESPEAKNG_LDFLAGS_OTHER}
-  )
+  # eSpeak (classic) first; if you later switch to espeak-ng, this will prefer espeak-ng
+  pkg_check_modules(ESPEAKNG QUIET espeak-ng)
+  if (ESPEAKNG_FOUND)
+    message(STATUS "Using eSpeak-NG")
+    target_compile_definitions(${TARGET} PRIVATE HAVE_ESPEAK_NG)
+    target_include_directories(${TARGET} PRIVATE ${ESPEAKNG_INCLUDE_DIRS})
+    target_link_libraries(${TARGET} PRIVATE ${ESPEAKNG_LIBRARIES})
+  else()
+    pkg_check_modules(ESPEAK REQUIRED espeak)
+    message(STATUS "Using classic eSpeak")
+    target_compile_definitions(${TARGET} PRIVATE HAVE_ESPEAK)
+    target_include_directories(${TARGET} PRIVATE ${ESPEAK_INCLUDE_DIRS})
+    target_link_libraries(${TARGET} PRIVATE ${ESPEAK_LIBRARIES})
+  endif()
 endif()
 
-# Install into /usr/bin (Yocto respects ${CMAKE_INSTALL_BINDIR})
-install(TARGETS ${TARGET} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+# Install binary
+install(TARGETS ${TARGET}
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
