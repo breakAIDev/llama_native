@@ -149,8 +149,6 @@ struct VoiceIO {
                 return {};
             }
             // write sentinel
-            std::error_code ec;
-            fs::create_directories(outDir, ec);
             std::ofstream f(ok.string());
             f << "from=" << zipPath << "\n";
         }
