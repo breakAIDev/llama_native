@@ -142,13 +142,15 @@ struct VoiceIO {
         // sentinel to avoid re-unzip on every boot
         fs::path ok = outDir / ".unzipped.ok";
         if (!dir_nonempty(outDir) || !fs::exists(ok)) {
-            std::string cmd = "unzip -q -o " + sh_quote(zipPath) + " -d " + sh_quote(outDir.string());
+            std::string cmd = "unzip -q -o " + sh_quote(zipPath) + " -d " + sh_quote(root);
             int rc = std::system(cmd.c_str());
             if (rc != 0) {
-                LOG_ERR("[voice] unzip failed (%d) for %s -> %s\n", rc, zipPath.c_str(), outDir.string().c_str());
+                LOG_ERR("[voice] unzip failed (%d) for %s -> %s\n", rc, zipPath.c_str(), root.c_str());
                 return {};
             }
             // write sentinel
+            std::error_code ec;
+            fs::create_directories(outDir, ec);
             std::ofstream f(ok.string());
             f << "from=" << zipPath << "\n";
         }
