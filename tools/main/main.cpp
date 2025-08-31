@@ -34,7 +34,7 @@
 #endif
 
 // ========================= Voice I/O (optional) =========================
-#ifdef WITH_VOICE_IO
+// #ifdef WITH_VOICE_IO
 #include <queue>
 #include <mutex>
 #include <condition_variable>
@@ -187,7 +187,7 @@ struct VoiceIO {
 };
 
 static VoiceIO g_voice;
-#endif // WITH_VOICE_IO
+// #endif // WITH_VOICE_IO
 // =======================================================================
 
 // ----------------------- Globals from original CLI ----------------------
@@ -580,13 +580,13 @@ int main(int argc, char ** argv) {
     }
 	
     // Init voice I/O (optional)
-#ifdef WITH_VOICE_IO
+// #ifdef WITH_VOICE_IO
     if (!g_voice.init()) {
         LOG_ERR("[voice] init failed; continuing with keyboard input\n");
     } else {
         g_voice.tts_say("Hello, I'm ready. Please speak.");
     }
-#endif
+// #endif
 
     if (params.interactive) {
         LOG_INF("%s: interactive mode on.\n", __func__);
@@ -981,10 +981,10 @@ int main(int argc, char ** argv) {
 
                     if (params.enable_chat_template) {
                         chat_add_and_format("assistant", assistant_ss.str());
+// #ifdef WITH_VOICE_IO
+                        g_voice.tts_say(assistant_ss.str());
+// #endif
                     }
-#ifdef WITH_VOICE_IO
-                    g_voice.tts_say(assistant_ss.str());
-#endif
                     is_interacting = true;
                     LOG("\n");
                 }
@@ -1014,11 +1014,11 @@ int main(int argc, char ** argv) {
                 }
 
                 std::string buffer;
-#ifdef WITH_VOICE_IO
+// #ifdef WITH_VOICE_IO
                 // block until we get a final utterance from Vosk
                 buffer = g_voice.wait_utt();
                 LOG_INF("[mic] %s\n", buffer.c_str());
-#else
+// #else
                 if (!params.input_prefix.empty() && !params.conversation_mode) {
                     LOG_DBG("appending input prefix: '%s'\n", params.input_prefix.c_str());
                     LOG("%s", params.input_prefix.c_str());
@@ -1051,7 +1051,7 @@ int main(int argc, char ** argv) {
                     // then returning control by pressing return again.
                     buffer.pop_back();
                 }
-#endif
+// #endif
                 if (buffer.empty()) { // Enter key on empty line lets the user pass control back
                     LOG_DBG("empty line, passing control back\n");
                 } else { // Add tokens to embd only if the input buffer is non-empty
@@ -1132,10 +1132,10 @@ int main(int argc, char ** argv) {
         if (params.interactive && n_remain <= 0 && params.n_predict >= 0) {
             n_remain = params.n_predict;
             is_interacting = true;
-#ifdef WITH_VOICE_IO
+// #ifdef WITH_VOICE_IO
             // speak what we have so far in this turn
             g_voice.tts_say(assistant_ss.str());
-#endif
+// #endif
         }
     }
 
@@ -1149,9 +1149,9 @@ int main(int argc, char ** argv) {
 
     common_sampler_free(smpl);
 
-#ifdef WITH_VOICE_IO
+// #ifdef WITH_VOICE_IO
     g_voice.shutdown();
-#endif
+// #endif
 
     llama_backend_free();
 
