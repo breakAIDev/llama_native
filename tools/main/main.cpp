@@ -83,6 +83,44 @@ struct VoiceIO {
     std::condition_variable cv;
 
     // ---------- helpers ----------
+    static int env_get_int(const char* name, int defv) {
+        const char* v = std::getenv(name);
+        if (!v || !*v) return defv;
+        char* end = nullptr;
+        long x = std::strtol(v, &end, 10);
+        return (end == v) ? defv : (int)x;
+    }
+
+    static int pick_pa_input_device() {
+        int n = Pa_GetDeviceCount();
+        if (n < 0) return paNoDevice;
+        int best = paNoDevice;
+
+        for (int i = 0; i < n; ++i) {
+            const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
+            if (!di || di->maxInputChannels <= 0) continue;
+
+            // Prefer something that looks like a USB mic
+            std::string name = di->name ? di->name : "";
+            if (name.find("USB") != std::string::npos || name.find("Mic") != std::string::npos) {
+                return i;
+            }
+            if (best == paNoDevice) best = i; // fallback to first input-capable
+        }
+        return best;
+    }
+
+    static void log_pa_devices() {
+        int n = Pa_GetDeviceCount();
+        for (int i = 0; i < n; ++i) {
+            const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
+            const PaHostApiInfo* ai = Pa_GetHostApiInfo(di->hostApi);
+            fprintf(stderr, "[audio] #%d api=%s in=%d out=%d name=%s\n",
+                i, ai ? ai->name : "?", di ? di->maxInputChannels : 0,
+                di ? di->maxOutputChannels : 0, di && di->name ? di->name : "?");
+        }
+    }
+
     static std::string env_or(const char* name, const char* fallback) {
         const char* v = std::getenv(name);
         return (v && *v) ? std::string(v) : std::string(fallback ? fallback : "");
@@ -190,28 +228,59 @@ struct VoiceIO {
 
     // ---------- capture thread ----------
     void thread_fn() {
-        PaStreamParameters in{};
-        in.device = Pa_GetDefaultInputDevice();
-        if (in.device == paNoDevice) {
-            LOG_ERR("[voice] No default input device\n");
+        PaError err;
+
+        int dev = env_get_int("VOICE_IN_DEV", -1);
+        if (dev < 0) {
+            dev = Pa_GetDefaultInputDevice();
+            if (dev == paNoDevice) dev = pick_pa_input_device();
+        }
+
+        if (dev == paNoDevice) {
+            LOG_ERR("[voice] No input device found. Listing devices:\n");
+            log_pa_devices();
             return;
         }
+
+        PaStreamParameters in{};
+        in.device = dev;
         const PaDeviceInfo* di = Pa_GetDeviceInfo(in.device);
+        if (!di) {
+            LOG_ERR("[voice] Invalid input device index %d\n", dev);
+            return;
+        }
+
         in.channelCount = channels;
         in.sampleFormat = paInt16;
         in.suggestedLatency = di->defaultLowInputLatency;
 
-        if (Pa_OpenStream(&pa_in, &in, nullptr, srate, framesPer, paNoFlag, nullptr, nullptr) != paNoError) {
-            LOG_ERR("[voice] Pa_OpenStream failed\n");
+        err = Pa_OpenStream(&pa_in, &in, nullptr, srate, framesPer, paNoFlag, nullptr, nullptr);
+        if (err != paNoError) {
+            LOG_ERR("[voice] Pa_OpenStream(%s) failed: %s\n", di->name, Pa_GetErrorText(err));
+            LOG_ERR("[voice] Listing devices to help you choose VOICE_IN_DEV:\n");
+            log_pa_devices();
             return;
         }
-        Pa_StartStream(pa_in);
+
+        err = Pa_StartStream(pa_in);
+        if (err != paNoError) {
+            LOG_ERR("[voice] Pa_StartStream failed: %s\n", Pa_GetErrorText(err));
+            Pa_CloseStream(pa_in);
+            pa_in = nullptr;
+            return;
+        }
 
         std::vector<int16_t> buf(framesPer);
         while (running) {
-            if (Pa_ReadStream(pa_in, buf.data(), (unsigned long)buf.size()) != paNoError) continue;
-            // feed int16 PCM to Vosk
-            vosk_recognizer_accept_waveform(vrec, (const char*)buf.data(), (int)(buf.size() * sizeof(int16_t)));
+            err = Pa_ReadStream(pa_in, buf.data(), buf.size());
+            if (err == paInputOverflowed) {
+                continue; // benign, just drop this chunk
+            } else if (err != paNoError) {
+                Pa_Sleep(10);
+                continue;
+            }
+
+            vosk_recognizer_accept_waveform(vrec, (const char*)buf.data(), buf.size()*sizeof(int16_t));
 
             const char* rj = vosk_recognizer_result(vrec);
             if (rj && rj[0]) {
@@ -227,9 +296,11 @@ struct VoiceIO {
             }
         }
 
-        Pa_StopStream(pa_in);
-        Pa_CloseStream(pa_in);
-        pa_in = nullptr;
+        if (pa_in) {
+            Pa_StopStream(pa_in);
+            Pa_CloseStream(pa_in);
+            pa_in = nullptr;
+        }
     }
 
     // ---------- lifecycle ----------
