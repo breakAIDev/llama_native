@@ -38,13 +38,29 @@
 #include <queue>
 #include <mutex>
 #include <condition_variable>
+#include <cstdlib>
+#include <filesystem>
+#include <chrono>
 
 #include <portaudio.h>
 #include <vosk_api.h>
 #include <espeak/speak_lib.h>
 
 #ifndef VOSK_DEFAULT_MODEL_DIR
-#define VOSK_DEFAULT_MODEL_DIR "/etc/models/vosk-model-small-en-us-0.15"
+#define VOSK_DEFAULT_MODEL_DIR "/etc/models/vosk-model-small-en-us-0.15.zip"
+#endif
+
+#ifndef VOSK_DEFAULT_MODEL_PATH
+  #ifdef VOSK_DEFAULT_MODEL_DIR
+    #define VOSK_DEFAULT_MODEL_PATH VOSK_DEFAULT_MODEL_DIR
+  #else
+    #define VOSK_DEFAULT_MODEL_PATH "/usr/share/vosk/models/en/model"
+  #endif
+#endif
+
+// Simple logging stubs (use your own)
+#ifndef LOG_ERR
+#define LOG_ERR(...) fprintf(stderr, __VA_ARGS__)
 #endif
 
 struct VoiceIO {
@@ -52,7 +68,7 @@ struct VoiceIO {
     int   srate      = 16000;
     int   channels   = 1;
     int   framesPer  = 512;
-    const char* tts_voice = "en-us";
+    std::string tts_voice = "en-us";     // FIX: keep storage
     int   tts_rate_wpm = 170;
 
     // state
@@ -66,9 +82,10 @@ struct VoiceIO {
     std::mutex              mu;
     std::condition_variable cv;
 
+    // ---------- helpers ----------
     static std::string env_or(const char* name, const char* fallback) {
         const char* v = std::getenv(name);
-        return v && *v ? std::string(v) : std::string(fallback);
+        return (v && *v) ? std::string(v) : std::string(fallback ? fallback : "");
     }
 
     static std::string jget(const std::string& s, const char* key) {
@@ -80,10 +97,87 @@ struct VoiceIO {
         return s.substr(p+1, e-p-1);
     }
 
+    static bool ends_with(const std::string& s, const char* suf) {
+        size_t n = s.size(), m = std::char_traits<char>::length(suf);
+        return n >= m && s.compare(n-m, m, suf) == 0;
+    }
+
+    static std::string sh_quote(const std::string& p) {
+        // POSIX-safe single-quote wrapping: 'a'b'c'
+        std::string out = "'";
+        for (char c : p) {
+            if (c == '\'') out += "'\"'\"'";
+            else out += c;
+        }
+        out += "'";
+        return out;
+    }
+
+    static bool dir_nonempty(const std::filesystem::path& d) {
+        namespace fs = std::filesystem;
+        if (!fs::exists(d) || !fs::is_directory(d)) return false;
+        for (auto it = fs::directory_iterator(d); it != fs::directory_iterator(); ++it) {
+            return true; // found at least one entry
+        }
+        return false;
+    }
+
+    // Unpack model.zip -> cacheDir; return unpacked dir path (or empty on failure)
+    static std::string unzip_to_cache(const std::string& zipPath) {
+        namespace fs = std::filesystem;
+        // cache target: env VOSK_MODEL_UNZIP_DIR or /etc/models/vosk/<zip base>
+        std::string base = zipPath;
+        // strip directories
+        auto slash = base.find_last_of("/\\");
+        if (slash != std::string::npos) base = base.substr(slash+1);
+        // strip .zip
+        if (ends_with(base, ".zip")) base = base.substr(0, base.size()-4);
+
+        std::string root = env_or("VOSK_MODEL_UNZIP_DIR", "/etc/models/vosk");
+        fs::path outDir = fs::path(root) / base;
+
+        std::error_code ec;
+        fs::create_directories(outDir, ec); (void)ec;
+
+        // sentinel to avoid re-unzip on every boot
+        fs::path ok = outDir / ".unzipped.ok";
+        if (!dir_nonempty(outDir) || !fs::exists(ok)) {
+            std::string cmd = "unzip -q -o " + sh_quote(zipPath) + " -d " + sh_quote(outDir.string());
+            int rc = std::system(cmd.c_str());
+            if (rc != 0) {
+                LOG_ERR("[voice] unzip failed (%d) for %s -> %s\n", rc, zipPath.c_str(), outDir.string().c_str());
+                return {};
+            }
+            // write sentinel
+            std::ofstream f(ok.string());
+            f << "from=" << zipPath << "\n";
+        }
+        return outDir.string();
+    }
+
+    // Accepts dir OR .zip; returns usable dir (unzips if needed)
+    static std::string ensure_model_dir(const std::string& path) {
+        namespace fs = std::filesystem;
+        if (path.empty()) return {};
+        fs::path p(path);
+        if (fs::exists(p) && fs::is_directory(p)) return path;
+        if (fs::exists(p) && fs::is_regular_file(p) && ends_with(path, ".zip")) {
+            return unzip_to_cache(path);
+        }
+        // allow users to pass a parent dir that contains one child directory (common model zips)
+        if (fs::exists(p) && fs::is_directory(p)) {
+            for (auto& e : fs::directory_iterator(p)) {
+                if (e.is_directory()) return e.path().string();
+            }
+        }
+        return {};
+    }
+
+    // ---------- TTS ----------
     bool tts_init() {
         int sr = espeak_Initialize(AUDIO_OUTPUT_PLAYBACK, 0, nullptr, 0);
         if (sr <= 0) return false;
-        espeak_SetVoiceByName(tts_voice);
+        espeak_SetVoiceByName(tts_voice.c_str());
         espeak_SetParameter(espeakRATE, tts_rate_wpm, 0);
         return true;
     }
@@ -94,6 +188,7 @@ struct VoiceIO {
         espeak_Synchronize();
     }
 
+    // ---------- capture thread ----------
     void thread_fn() {
         PaStreamParameters in{};
         in.device = Pa_GetDefaultInputDevice();
@@ -114,10 +209,10 @@ struct VoiceIO {
 
         std::vector<int16_t> buf(framesPer);
         while (running) {
-            if (Pa_ReadStream(pa_in, buf.data(), buf.size()) != paNoError) continue;
-            vosk_recognizer_accept_waveform(vrec, (const char*)buf.data(), buf.size()*sizeof(int16_t));
+            if (Pa_ReadStream(pa_in, buf.data(), (unsigned long)buf.size()) != paNoError) continue;
+            // feed int16 PCM to Vosk
+            vosk_recognizer_accept_waveform(vrec, (const char*)buf.data(), (int)(buf.size() * sizeof(int16_t)));
 
-            // when Vosk finalizes a segment, result() returns a final JSON with "text"
             const char* rj = vosk_recognizer_result(vrec);
             if (rj && rj[0]) {
                 std::string js(rj);
@@ -137,11 +232,24 @@ struct VoiceIO {
         pa_in = nullptr;
     }
 
+    // ---------- lifecycle ----------
     bool init() {
-        // model path via env VOSK_MODEL or default macro
-        std::string model_dir = env_or("VOSK_MODEL", VOSK_DEFAULT_MODEL_DIR);
-        std::string tts_v = env_or("ESPEAK_VOICE", tts_voice);
-        if (!tts_v.empty()) tts_voice = tts_v.c_str();
+        // Accept dir OR .zip via env, falling back to default macro
+        std::string model_path = env_or("VOSK_MODEL", VOSK_DEFAULT_MODEL_PATH);
+        // Optional separate envs (if you want to support both)
+        if (model_path.empty()) model_path = env_or("VOSK_MODEL_DIR", "");
+        if (model_path.empty()) model_path = env_or("VOSK_MODEL_ZIP", "");
+
+        // Apply TTS voice override (safe now that tts_voice is std::string)
+        std::string tts_v = env_or("ESPEAK_VOICE", "");
+        if (!tts_v.empty()) tts_voice = tts_v;
+
+        // Ensure we have an unpacked directory (unzips if a .zip was given)
+        std::string model_dir = ensure_model_dir(model_path);
+        if (model_dir.empty()) {
+            LOG_ERR("[voice] cannot prepare vosk model from path: %s\n", model_path.c_str());
+            return false;
+        }
 
         vosk_set_log_level(-1);
         vmodel = vosk_model_new(model_dir.c_str());
