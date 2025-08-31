@@ -14,8 +14,6 @@
 #include <sstream>
 #include <string>
 #include <vector>
-#include <thread>
-#include <atomic>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -33,164 +31,6 @@
 #pragma warning(disable: 4244 4267) // possible loss of data
 #endif
 
-// ========================= Voice I/O (optional) =========================
-#ifdef WITH_VOICE_IO
-#include <queue>
-#include <mutex>
-#include <condition_variable>
-
-#include <portaudio.h>
-#include <vosk_api.h>
-#include <espeak/speak_lib.h>
-
-#ifndef VOSK_DEFAULT_MODEL_DIR
-#define VOSK_DEFAULT_MODEL_DIR "/etc/models/vosk-model-small-en-us-0.15"
-#endif
-
-struct VoiceIO {
-    // config
-    int   srate      = 16000;
-    int   channels   = 1;
-    int   framesPer  = 512;
-    const char* tts_voice = "en-us";
-    int   tts_rate_wpm = 170;
-
-    // state
-    std::atomic<bool> running{false};
-    std::thread       th;
-    PaStream*         pa_in = nullptr;
-    VoskModel*        vmodel = nullptr;
-    VoskRecognizer*   vrec   = nullptr;
-
-    std::queue<std::string> q;
-    std::mutex              mu;
-    std::condition_variable cv;
-
-    static std::string env_or(const char* name, const char* fallback) {
-        const char* v = std::getenv(name);
-        return v && *v ? std::string(v) : std::string(fallback);
-    }
-
-    static std::string jget(const std::string& s, const char* key) {
-        std::string k = std::string("\"") + key + "\"";
-        size_t p = s.find(k); if (p == std::string::npos) return "";
-        p = s.find(':', p);   if (p == std::string::npos) return "";
-        p = s.find('"', p);   if (p == std::string::npos) return "";
-        size_t e = s.find('"', p+1); if (e == std::string::npos) return "";
-        return s.substr(p+1, e-p-1);
-    }
-
-    bool tts_init() {
-        int sr = espeak_Initialize(AUDIO_OUTPUT_PLAYBACK, 0, nullptr, 0);
-        if (sr <= 0) return false;
-        espeak_SetVoiceByName(tts_voice);
-        espeak_SetParameter(espeakRATE, tts_rate_wpm, 0);
-        return true;
-    }
-
-    void tts_say(const std::string& text) {
-        if (text.empty()) return;
-        espeak_Synth(text.c_str(), text.size()+1, 0, POS_CHARACTER, 0, espeakCHARS_AUTO, nullptr, nullptr);
-        espeak_Synchronize();
-    }
-
-    void thread_fn() {
-        PaStreamParameters in{};
-        in.device = Pa_GetDefaultInputDevice();
-        if (in.device == paNoDevice) {
-            LOG_ERR("[voice] No default input device\n");
-            return;
-        }
-        const PaDeviceInfo* di = Pa_GetDeviceInfo(in.device);
-        in.channelCount = channels;
-        in.sampleFormat = paInt16;
-        in.suggestedLatency = di->defaultLowInputLatency;
-
-        if (Pa_OpenStream(&pa_in, &in, nullptr, srate, framesPer, paNoFlag, nullptr, nullptr) != paNoError) {
-            LOG_ERR("[voice] Pa_OpenStream failed\n");
-            return;
-        }
-        Pa_StartStream(pa_in);
-
-        std::vector<int16_t> buf(framesPer);
-        while (running) {
-            if (Pa_ReadStream(pa_in, buf.data(), buf.size()) != paNoError) continue;
-            vosk_recognizer_accept_waveform(vrec, (const char*)buf.data(), buf.size()*sizeof(int16_t));
-
-            // when Vosk finalizes a segment, result() returns a final JSON with "text"
-            const char* rj = vosk_recognizer_result(vrec);
-            if (rj && rj[0]) {
-                std::string js(rj);
-                std::string txt = jget(js, "text");
-                if (!txt.empty()) {
-                    {
-                        std::lock_guard<std::mutex> lk(mu);
-                        q.push(txt);
-                    }
-                    cv.notify_one();
-                }
-            }
-        }
-
-        Pa_StopStream(pa_in);
-        Pa_CloseStream(pa_in);
-        pa_in = nullptr;
-    }
-
-    bool init() {
-        // model path via env VOSK_MODEL or default macro
-        std::string model_dir = env_or("VOSK_MODEL", VOSK_DEFAULT_MODEL_DIR);
-        std::string tts_v = env_or("ESPEAK_VOICE", tts_voice);
-        if (!tts_v.empty()) tts_voice = tts_v.c_str();
-
-        vosk_set_log_level(-1);
-        vmodel = vosk_model_new(model_dir.c_str());
-        if (!vmodel) {
-            LOG_ERR("[voice] cannot load vosk model at %s\n", model_dir.c_str());
-            return false;
-        }
-        vrec = vosk_recognizer_new(vmodel, (float)srate);
-        if (!vrec) {
-            LOG_ERR("[voice] cannot create recognizer\n");
-            return false;
-        }
-
-        if (Pa_Initialize() != paNoError) {
-            LOG_ERR("[voice] PortAudio init failed\n");
-            return false;
-        }
-        if (!tts_init()) {
-            LOG_ERR("[voice] eSpeak NG init failed\n");
-            return false;
-        }
-
-        running = true;
-        th = std::thread(&VoiceIO::thread_fn, this);
-        return true;
-    }
-
-    void shutdown() {
-        running = false;
-        if (th.joinable()) th.join();
-        if (vrec)   { vosk_recognizer_free(vrec); vrec = nullptr; }
-        if (vmodel) { vosk_model_free(vmodel);     vmodel = nullptr; }
-        Pa_Terminate();
-    }
-
-    std::string wait_utt() {
-        std::unique_lock<std::mutex> lk(mu);
-        cv.wait(lk, [&]{ return !q.empty(); });
-        std::string s = std::move(q.front());
-        q.pop();
-        return s;
-    }
-};
-
-static VoiceIO g_voice;
-#endif // WITH_VOICE_IO
-// =======================================================================
-
-// ----------------------- Globals from original CLI ----------------------
 static llama_context           ** g_ctx;
 static llama_model             ** g_model;
 static common_sampler          ** g_smpl;
@@ -578,15 +418,6 @@ int main(int argc, char ** argv) {
         SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
     }
-	
-    // Init voice I/O (optional)
-#ifdef WITH_VOICE_IO
-    if (!g_voice.init()) {
-        LOG_ERR("[voice] init failed; continuing with keyboard input\n");
-    } else {
-        g_voice.tts_say("Hello, I'm ready. Please speak.");
-    }
-#endif
 
     if (params.interactive) {
         LOG_INF("%s: interactive mode on.\n", __func__);
@@ -982,9 +813,6 @@ int main(int argc, char ** argv) {
                     if (params.enable_chat_template) {
                         chat_add_and_format("assistant", assistant_ss.str());
                     }
-#ifdef WITH_VOICE_IO
-                    g_voice.tts_say(assistant_ss.str());
-#endif
                     is_interacting = true;
                     LOG("\n");
                 }
@@ -1014,11 +842,6 @@ int main(int argc, char ** argv) {
                 }
 
                 std::string buffer;
-#ifdef WITH_VOICE_IO
-                // block until we get a final utterance from Vosk
-                buffer = g_voice.wait_utt();
-                LOG_INF("[mic] %s\n", buffer.c_str());
-#else
                 if (!params.input_prefix.empty() && !params.conversation_mode) {
                     LOG_DBG("appending input prefix: '%s'\n", params.input_prefix.c_str());
                     LOG("%s", params.input_prefix.c_str());
@@ -1051,7 +874,7 @@ int main(int argc, char ** argv) {
                     // then returning control by pressing return again.
                     buffer.pop_back();
                 }
-#endif
+
                 if (buffer.empty()) { // Enter key on empty line lets the user pass control back
                     LOG_DBG("empty line, passing control back\n");
                 } else { // Add tokens to embd only if the input buffer is non-empty
@@ -1132,10 +955,6 @@ int main(int argc, char ** argv) {
         if (params.interactive && n_remain <= 0 && params.n_predict >= 0) {
             n_remain = params.n_predict;
             is_interacting = true;
-#ifdef WITH_VOICE_IO
-            // speak what we have so far in this turn
-            g_voice.tts_say(assistant_ss.str());
-#endif
         }
     }
 
@@ -1148,10 +967,6 @@ int main(int argc, char ** argv) {
     common_perf_print(ctx, smpl);
 
     common_sampler_free(smpl);
-
-#ifdef WITH_VOICE_IO
-    g_voice.shutdown();
-#endif
 
     llama_backend_free();
 
