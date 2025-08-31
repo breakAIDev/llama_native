@@ -44,7 +44,7 @@
 #include <espeak/speak_lib.h>
 
 #ifndef VOSK_DEFAULT_MODEL_DIR
-#define VOSK_DEFAULT_MODEL_DIR "/usr/share/vosk/models/vosk-model-small-en-us-0.15"
+#define VOSK_DEFAULT_MODEL_DIR "/etc/models/vosk-model-small-en-us-0.15"
 #endif
 
 struct VoiceIO {
