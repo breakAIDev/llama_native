@@ -64,14 +64,14 @@
 #endif
 
 struct VoiceIO {
-    // config
-    int   srate      = 16000;
+    // ---------- config ----------
+    int   srate      = 16000;          // desired; actual is derived from the opened stream
     int   channels   = 1;
     int   framesPer  = 512;
-    std::string tts_voice = "en-us";     // FIX: keep storage
+    std::string tts_voice = "en-us";
     int   tts_rate_wpm = 170;
 
-    // state
+    // ---------- state ----------
     std::atomic<bool> running{false};
     std::thread       th;
     PaStream*         pa_in = nullptr;
@@ -82,50 +82,37 @@ struct VoiceIO {
     std::mutex              mu;
     std::condition_variable cv;
 
+    // ---------- tiny logging ----------
+    static void LOG_ERR(const char *fmt, ...) {
+        va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
+    }
+
     // ---------- helpers ----------
-    static int env_get_int(const char* name, int defv) {
-        const char* v = std::getenv(name);
-        if (!v || !*v) return defv;
-        char* end = nullptr;
-        long x = std::strtol(v, &end, 10);
-        return (end == v) ? defv : (int)x;
-    }
-
-    static int pick_pa_input_device() {
-        int n = Pa_GetDeviceCount();
-        if (n < 0) return paNoDevice;
-        int best = paNoDevice;
-
-        for (int i = 0; i < n; ++i) {
-            const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
-            if (!di || di->maxInputChannels <= 0) continue;
-
-            // Prefer something that looks like a USB mic
-            std::string name = di->name ? di->name : "";
-            if (name.find("USB") != std::string::npos || name.find("Mic") != std::string::npos) {
-                return i;
-            }
-            if (best == paNoDevice) best = i; // fallback to first input-capable
-        }
-        return best;
-    }
-
-    static void log_pa_devices() {
-        int n = Pa_GetDeviceCount();
-        for (int i = 0; i < n; ++i) {
-            const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
-            const PaHostApiInfo* ai = Pa_GetHostApiInfo(di->hostApi);
-            fprintf(stderr, "[audio] #%d api=%s in=%d out=%d name=%s\n",
-                i, ai ? ai->name : "?", di ? di->maxInputChannels : 0,
-                di ? di->maxOutputChannels : 0, di && di->name ? di->name : "?");
-        }
-    }
-
     static std::string env_or(const char* name, const char* fallback) {
         const char* v = std::getenv(name);
         return (v && *v) ? std::string(v) : std::string(fallback ? fallback : "");
     }
-
+    static int env_get_int(const char* name, int defv) {
+        const char* v = std::getenv(name);
+        if (!v || !*v) return defv;
+        char* end = nullptr; long x = std::strtol(v, &end, 10);
+        return (end == v) ? defv : (int)x;
+    }
+    static bool ends_with(const std::string& s, const char* suf) {
+        size_t n = s.size(), m = std::char_traits<char>::length(suf);
+        return n >= m && s.compare(n-m, m, suf) == 0;
+    }
+    static std::string sh_quote(const std::string& p) {
+        std::string out = "'";
+        for (char c : p) out += (c == '\'' ? "'\"'\"'" : std::string(1,c));
+        out += "'";
+        return out;
+    }
+    static bool dir_nonempty(const std::filesystem::path& d) {
+        namespace fs = std::filesystem;
+        if (!fs::exists(d) || !fs::is_directory(d)) return false;
+        return fs::directory_iterator(d) != fs::directory_iterator();
+    }
     static std::string jget(const std::string& s, const char* key) {
         std::string k = std::string("\"") + key + "\"";
         size_t p = s.find(k); if (p == std::string::npos) return "";
@@ -135,40 +122,14 @@ struct VoiceIO {
         return s.substr(p+1, e-p-1);
     }
 
-    static bool ends_with(const std::string& s, const char* suf) {
-        size_t n = s.size(), m = std::char_traits<char>::length(suf);
-        return n >= m && s.compare(n-m, m, suf) == 0;
-    }
-
-    static std::string sh_quote(const std::string& p) {
-        // POSIX-safe single-quote wrapping: 'a'b'c'
-        std::string out = "'";
-        for (char c : p) {
-            if (c == '\'') out += "'\"'\"'";
-            else out += c;
-        }
-        out += "'";
-        return out;
-    }
-
-    static bool dir_nonempty(const std::filesystem::path& d) {
-        namespace fs = std::filesystem;
-        if (!fs::exists(d) || !fs::is_directory(d)) return false;
-        for (auto it = fs::directory_iterator(d); it != fs::directory_iterator(); ++it) {
-            return true; // found at least one entry
-        }
-        return false;
-    }
-
-    // Unpack model.zip -> cacheDir; return unpacked dir path (or empty on failure)
+    // ---------- model unzip / path resolve ----------
     static std::string unzip_to_cache(const std::string& zipPath) {
         namespace fs = std::filesystem;
-        // cache target: env VOSK_MODEL_UNZIP_DIR or /etc/models/vosk/<zip base>
+
+        // derive output: $VOSK_MODEL_UNZIP_DIR/<zip-base-without-ext>
         std::string base = zipPath;
-        // strip directories
         auto slash = base.find_last_of("/\\");
         if (slash != std::string::npos) base = base.substr(slash+1);
-        // strip .zip
         if (ends_with(base, ".zip")) base = base.substr(0, base.size()-4);
 
         std::string root = env_or("VOSK_MODEL_UNZIP_DIR", "/etc/models/vosk");
@@ -177,23 +138,23 @@ struct VoiceIO {
         std::error_code ec;
         fs::create_directories(outDir, ec); (void)ec;
 
-        // sentinel to avoid re-unzip on every boot
         fs::path ok = outDir / ".unzipped.ok";
         if (!dir_nonempty(outDir) || !fs::exists(ok)) {
+            // unzip into outDir (not the parent) to avoid double nesting
             std::string cmd = "unzip -q -o " + sh_quote(zipPath) + " -d " + sh_quote(root);
             int rc = std::system(cmd.c_str());
             if (rc != 0) {
                 LOG_ERR("[voice] unzip failed (%d) for %s -> %s\n", rc, zipPath.c_str(), root.c_str());
                 return {};
             }
-            // write sentinel
+
             std::ofstream f(ok.string());
             f << "from=" << zipPath << "\n";
         }
+
         return outDir.string();
     }
 
-    // Accepts dir OR .zip; returns usable dir (unzips if needed)
     static std::string ensure_model_dir(const std::string& path) {
         namespace fs = std::filesystem;
         if (path.empty()) return {};
@@ -202,13 +163,53 @@ struct VoiceIO {
         if (fs::exists(p) && fs::is_regular_file(p) && ends_with(path, ".zip")) {
             return unzip_to_cache(path);
         }
-        // allow users to pass a parent dir that contains one child directory (common model zips)
-        if (fs::exists(p) && fs::is_directory(p)) {
-            for (auto& e : fs::directory_iterator(p)) {
-                if (e.is_directory()) return e.path().string();
+        return {};
+    }
+
+    // ---------- PortAudio device helpers ----------
+    static void log_pa_devices() {
+        int n = Pa_GetDeviceCount();
+        for (int i = 0; i < n; ++i) {
+            const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
+            const PaHostApiInfo* ai = di ? Pa_GetHostApiInfo(di->hostApi) : nullptr;
+            fprintf(stderr, "[audio] #%d api=%s in=%d out=%d name=%s (defaultSR=%.0f)\n",
+                    i, ai?ai->name:"?", di?di->maxInputChannels:0,
+                    di?di->maxOutputChannels:0, di && di->name ? di->name : "?",
+                    di?di->defaultSampleRate:0.0);
+        }
+    }
+    // pick by substring name (VOICE_IN_DEV as text), else by index (VOICE_IN_DEV as int)
+    static int pick_input_device_from_env() {
+        const char* env = std::getenv("VOICE_IN_DEV");
+        if (env && *env) {
+            // try as integer index first
+            char* end=nullptr; long idx = std::strtol(env, &end, 10);
+            if (end && *end == '\0') {
+                if (idx >= 0 && idx < Pa_GetDeviceCount()) {
+                    const PaDeviceInfo* di = Pa_GetDeviceInfo((int)idx);
+                    if (di && di->maxInputChannels > 0) return (int)idx;
+                }
+            }
+            // substring match on name (or api+name)
+            std::string sub(env);
+            int n = Pa_GetDeviceCount();
+            for (int i = 0; i < n; ++i) {
+                const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
+                if (!di || di->maxInputChannels <= 0) continue;
+                const PaHostApiInfo* ai = Pa_GetHostApiInfo(di->hostApi);
+                std::string full = std::string(ai?ai->name:"") + " " + (di->name?di->name:"");
+                if (full.find(sub) != std::string::npos) return i;
             }
         }
-        return {};
+        // default input if available, else first input-capable
+        int dev = Pa_GetDefaultInputDevice();
+        if (dev != paNoDevice) return dev;
+        int n = Pa_GetDeviceCount();
+        for (int i = 0; i < n; ++i) {
+            const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
+            if (di && di->maxInputChannels > 0) return i;
+        }
+        return paNoDevice;
     }
 
     // ---------- TTS ----------
@@ -219,7 +220,6 @@ struct VoiceIO {
         espeak_SetParameter(espeakRATE, tts_rate_wpm, 0);
         return true;
     }
-
     void tts_say(const std::string& text) {
         if (text.empty()) return;
         espeak_Synth(text.c_str(), text.size()+1, 0, POS_CHARACTER, 0, espeakCHARS_AUTO, nullptr, nullptr);
@@ -228,70 +228,85 @@ struct VoiceIO {
 
     // ---------- capture thread ----------
     void thread_fn() {
-        PaError err;
-
-        int dev = env_get_int("VOICE_IN_DEV", -1);
-        if (dev < 0) {
-            dev = Pa_GetDefaultInputDevice();
-            if (dev == paNoDevice) dev = pick_pa_input_device();
-        }
-
+        // pick device
+        int dev = pick_input_device_from_env();
         if (dev == paNoDevice) {
-            LOG_ERR("[voice] No input device found. Listing devices:\n");
+            LOG_ERR("[voice] No input device. Set VOICE_IN_DEV (index or substring).\n");
             log_pa_devices();
             return;
         }
-
-        PaStreamParameters in{};
-        in.device = dev;
-        const PaDeviceInfo* di = Pa_GetDeviceInfo(in.device);
+        const PaDeviceInfo* di = Pa_GetDeviceInfo(dev);
         if (!di) {
-            LOG_ERR("[voice] Invalid input device index %d\n", dev);
+            LOG_ERR("[voice] Invalid device index %d\n", dev);
             return;
         }
 
-        in.channelCount = channels;
-        in.sampleFormat = paInt16;
+        // build in params
+        PaStreamParameters in{}; in.device = dev;
+        in.channelCount     = std::min(channels, di->maxInputChannels);
+        in.sampleFormat     = paInt16;
         in.suggestedLatency = di->defaultLowInputLatency;
 
-        err = Pa_OpenStream(&pa_in, &in, nullptr, srate, framesPer, paNoFlag, nullptr, nullptr);
+        // choose a rate the device supports in practice
+        int req = srate;
+        if (const char* e = std::getenv("VOICE_SRATE")) {
+            int r = std::atoi(e); if (r > 0) req = r;
+        } else if (di->defaultSampleRate > 0) {
+            req = (int)di->defaultSampleRate;
+        }
+
+        // Try requested → 48000 → 44100
+        PaError err = Pa_OpenStream(&pa_in, &in, nullptr, req, framesPer, paNoFlag, nullptr, nullptr);
+        if (err == paInvalidSampleRate || err == paSampleFormatNotSupported) {
+            int tries[] = { 48000, 44100 };
+            for (int r : tries) {
+                if (r == req) continue;
+                err = Pa_OpenStream(&pa_in, &in, nullptr, r, framesPer, paNoFlag, nullptr, nullptr);
+                if (err == paNoError) { req = r; break; }
+            }
+        }
         if (err != paNoError) {
-            LOG_ERR("[voice] Pa_OpenStream(%s) failed: %s\n", di->name, Pa_GetErrorText(err));
-            LOG_ERR("[voice] Listing devices to help you choose VOICE_IN_DEV:\n");
+            LOG_ERR("[voice] Pa_OpenStream(%s) failed: %s\n", di->name?di->name:"?", Pa_GetErrorText(err));
             log_pa_devices();
             return;
         }
 
-        err = Pa_StartStream(pa_in);
-        if (err != paNoError) {
+        if ((err = Pa_StartStream(pa_in)) != paNoError) {
             LOG_ERR("[voice] Pa_StartStream failed: %s\n", Pa_GetErrorText(err));
-            Pa_CloseStream(pa_in);
-            pa_in = nullptr;
+            Pa_CloseStream(pa_in); pa_in = nullptr;
+            return;
+        }
+
+        // actual sample rate
+        const PaStreamInfo *si = Pa_GetStreamInfo(pa_in);
+        int openedRate = (si && si->sampleRate > 0) ? (int)si->sampleRate : req;
+        srate = openedRate;
+
+        // create recognizer matching the opened rate
+        vrec = vosk_recognizer_new(vmodel, (float)srate);
+        if (!vrec) {
+            LOG_ERR("[voice] vosk_recognizer_new failed at %d Hz\n", srate);
+            Pa_StopStream(pa_in); Pa_CloseStream(pa_in); pa_in = nullptr;
             return;
         }
 
         std::vector<int16_t> buf(framesPer);
         while (running) {
-            err = Pa_ReadStream(pa_in, buf.data(), buf.size());
-            if (err == paInputOverflowed) {
-                continue; // benign, just drop this chunk
-            } else if (err != paNoError) {
-                Pa_Sleep(10);
-                continue;
-            }
+            err = Pa_ReadStream(pa_in, buf.data(), (unsigned long)buf.size());
+            if (err == paInputOverflowed) continue;
+            if (err != paNoError) { Pa_Sleep(10); continue; }
 
-            vosk_recognizer_accept_waveform(vrec, (const char*)buf.data(), buf.size()*sizeof(int16_t));
+            vosk_recognizer_accept_waveform(vrec, (const char*)buf.data(),
+                                            (int)(buf.size()*sizeof(int16_t)));
 
-            const char* rj = vosk_recognizer_result(vrec);
-            if (rj && rj[0]) {
-                std::string js(rj);
-                std::string txt = jget(js, "text");
-                if (!txt.empty()) {
-                    {
+            if (const char* rj = vosk_recognizer_result(vrec)) {
+                if (rj[0]) {
+                    std::string txt = jget(rj, "text");
+                    if (!txt.empty()) {
                         std::lock_guard<std::mutex> lk(mu);
                         q.push(txt);
+                        cv.notify_one();
                     }
-                    cv.notify_one();
                 }
             }
         }
@@ -301,36 +316,29 @@ struct VoiceIO {
             Pa_CloseStream(pa_in);
             pa_in = nullptr;
         }
+        if (vrec) { vosk_recognizer_free(vrec); vrec = nullptr; }
     }
 
     // ---------- lifecycle ----------
     bool init() {
-        // Accept dir OR .zip via env, falling back to default macro
+        // Prepare model dir (accept dir or .zip)
         std::string model_path = env_or("VOSK_MODEL", VOSK_DEFAULT_MODEL_PATH);
-        // Optional separate envs (if you want to support both)
         if (model_path.empty()) model_path = env_or("VOSK_MODEL_DIR", "");
         if (model_path.empty()) model_path = env_or("VOSK_MODEL_ZIP", "");
 
-        // Apply TTS voice override (safe now that tts_voice is std::string)
-        std::string tts_v = env_or("ESPEAK_VOICE", "");
-        if (!tts_v.empty()) tts_voice = tts_v;
+        if (auto v = env_or("ESPEAK_VOICE", ""); !v.empty()) tts_voice = v;
 
-        // Ensure we have an unpacked directory (unzips if a .zip was given)
         std::string model_dir = ensure_model_dir(model_path);
         if (model_dir.empty()) {
-            LOG_ERR("[voice] cannot prepare vosk model from path: %s\n", model_path.c_str());
+            LOG_ERR("[voice] cannot prepare Vosk model path from: %s\n", model_path.c_str());
             return false;
         }
 
         vosk_set_log_level(-1);
+
         vmodel = vosk_model_new(model_dir.c_str());
         if (!vmodel) {
-            LOG_ERR("[voice] cannot load vosk model at %s\n", model_dir.c_str());
-            return false;
-        }
-        vrec = vosk_recognizer_new(vmodel, (float)srate);
-        if (!vrec) {
-            LOG_ERR("[voice] cannot create recognizer\n");
+            LOG_ERR("[voice] cannot load Vosk model at %s\n", model_dir.c_str());
             return false;
         }
 
