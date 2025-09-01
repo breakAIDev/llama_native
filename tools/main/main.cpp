@@ -90,7 +90,9 @@ struct VoiceIO {
         return (int16_t)x;
     }
     static inline bool approx_ne(double a, double b, double eps = 1e-6) {
-        return std::fabs(a - b) <= eps;
+        double d = a - b;
+        if (d < 0) d = -d;
+        return d <= eps;
     }
 
     // ---------- simple linear resampler (block-continuous) ----------
