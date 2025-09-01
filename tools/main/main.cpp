@@ -39,6 +39,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <cstdlib>
+#include <cstdarg>
+#include <algorithm>
 #include <filesystem>
 #include <chrono>
 
@@ -58,23 +60,20 @@
   #endif
 #endif
 
-// Simple logging stubs (use your own)
-#ifndef LOG_ERR
-#define LOG_ERR(...) fprintf(stderr, __VA_ARGS__)
-#endif
-
 struct VoiceIO {
-    // ---------- config ----------
-    int   srate      = 16000;          // desired; actual is derived from the opened stream
-    int   channels   = 1;
-    int   framesPer  = 512;
-    std::string tts_voice = "en-us";
-    int   tts_rate_wpm = 170;
+    // ---------- config (overridable via env) ----------
+    int         srate      = 16000;     // target rate for Vosk
+    int         channels   = 1;
+    int         framesPer  = 512;
+    std::string tts_voice  = "en-us";
+    int         tts_rate_wpm = 170;
 
-    // ---------- state ----------
+    // ---------- runtime state ----------
     std::atomic<bool> running{false};
     std::thread       th;
-    PaStream*         pa_in = nullptr;
+    PaStream*         pa_in   = nullptr;
+    double            hw_rate = 0.0;    // actual device rate
+
     VoskModel*        vmodel = nullptr;
     VoskRecognizer*   vrec   = nullptr;
 
@@ -82,72 +81,115 @@ struct VoiceIO {
     std::mutex              mu;
     std::condition_variable cv;
 
-    // ---------- tiny logging ----------
-    static void LOG_ERR(const char *fmt, ...) {
-        va_list ap; va_start(ap, fmt); vfprintf(stderr, fmt, ap); va_end(ap);
-    }
+    // ---------- simple linear resampler (block-continuous) ----------
+    struct Resampler {
+        int     in_rate  = 0;
+        int     out_rate = 0;
+        double  pos      = 0.0;      // fractional input index for next out sample
+        int16_t last     = 0;        // last sample from previous block for continuity
+
+        void reset(int inr, int outr) {
+            in_rate  = inr;
+            out_rate = outr;
+            pos = 0.0;
+            last = 0;
+        }
+
+        // Append resampled data into 'out'
+        void process(const int16_t* in, size_t n_in, std::vector<int16_t>& out) {
+            if (n_in == 0) return;
+            if (in_rate <= 0 || out_rate <= 0 || in_rate == out_rate) {
+                out.insert(out.end(), in, in + n_in);
+                last = in[n_in - 1];
+                return;
+            }
+
+            const double step = (double)in_rate / (double)out_rate;
+            double p = pos;
+
+            // produce until we run past current input block
+            while (true) {
+                size_t idx1 = (size_t)p;              // next input index
+                if (idx1 >= n_in) break;
+                // for linear interpolation: s(t) = (1-a)*s0 + a*s1
+                const double a  = p - (double)idx1;
+                const int16_t s1 = in[idx1];
+                const int16_t s0 = (idx1 == 0) ? last : in[idx1 - 1];
+                const float sample = (float)((1.0 - a) * (double)s0 + a * (double)s1);
+                out.push_back((int16_t)std::lrintf(sample));
+                p += step;
+            }
+
+            last = in[n_in - 1];
+            pos  = p - (double)n_in; // keep fractional remainder for next block
+        }
+    } resampler;
 
     // ---------- helpers ----------
     static std::string env_or(const char* name, const char* fallback) {
         const char* v = std::getenv(name);
         return (v && *v) ? std::string(v) : std::string(fallback ? fallback : "");
     }
+
     static int env_get_int(const char* name, int defv) {
         const char* v = std::getenv(name);
         if (!v || !*v) return defv;
-        char* end = nullptr; long x = std::strtol(v, &end, 10);
+        char* end = nullptr;
+        long x = std::strtol(v, &end, 10);
         return (end == v) ? defv : (int)x;
     }
+
     static bool ends_with(const std::string& s, const char* suf) {
         size_t n = s.size(), m = std::char_traits<char>::length(suf);
-        return n >= m && s.compare(n-m, m, suf) == 0;
+        return n >= m && s.compare(n - m, m, suf) == 0;
     }
+
     static std::string sh_quote(const std::string& p) {
         std::string out = "'";
-        for (char c : p) out += (c == '\'' ? "'\"'\"'" : std::string(1,c));
+        for (char c : p) out += (c == '\'') ? "'\"'\"'" : std::string(1, c);
         out += "'";
         return out;
     }
+
     static bool dir_nonempty(const std::filesystem::path& d) {
         namespace fs = std::filesystem;
         if (!fs::exists(d) || !fs::is_directory(d)) return false;
-        return fs::directory_iterator(d) != fs::directory_iterator();
+        for (auto it = fs::directory_iterator(d); it != fs::directory_iterator(); ++it) return true;
+        return false;
     }
+
     static std::string jget(const std::string& s, const char* key) {
-        std::string k = std::string("\"") + key + "\"";
+        const std::string k = std::string("\"") + key + "\"";
         size_t p = s.find(k); if (p == std::string::npos) return "";
         p = s.find(':', p);   if (p == std::string::npos) return "";
         p = s.find('"', p);   if (p == std::string::npos) return "";
-        size_t e = s.find('"', p+1); if (e == std::string::npos) return "";
-        return s.substr(p+1, e-p-1);
+        size_t e = s.find('"', p + 1); if (e == std::string::npos) return "";
+        return s.substr(p + 1, e - p - 1);
     }
 
-    // ---------- model unzip / path resolve ----------
+    // unzip model.zip to cache dir; return folder that contains the model
     static std::string unzip_to_cache(const std::string& zipPath) {
         namespace fs = std::filesystem;
-
-        // derive output: $VOSK_MODEL_UNZIP_DIR/<zip-base-without-ext>
         std::string base = zipPath;
         auto slash = base.find_last_of("/\\");
-        if (slash != std::string::npos) base = base.substr(slash+1);
-        if (ends_with(base, ".zip")) base = base.substr(0, base.size()-4);
+        if (slash != std::string::npos) base = base.substr(slash + 1);
+        if (ends_with(base, ".zip"))    base = base.substr(0, base.size() - 4);
 
-        std::string root = env_or("VOSK_MODEL_UNZIP_DIR", "/etc/models/vosk");
-        fs::path outDir = fs::path(root) / base;
+        const std::string root   = env_or("VOSK_MODEL_UNZIP_DIR", "/etc/models/vosk");
+        const fs::path    outDir = fs::path(root) / base;
 
         std::error_code ec;
-        fs::create_directories(outDir, ec); (void)ec;
+        fs::create_directories(outDir, ec);
 
-        fs::path ok = outDir / ".unzipped.ok";
+        const fs::path ok = outDir / ".unzipped.ok";
         if (!dir_nonempty(outDir) || !fs::exists(ok)) {
-            // unzip into outDir (not the parent) to avoid double nesting
-            std::string cmd = "unzip -q -o " + sh_quote(zipPath) + " -d " + sh_quote(root);
-            int rc = std::system(cmd.c_str());
+            // unzip into root (not outDir) to preserve internal top-level dir names
+            const std::string cmd = "unzip -q -o " + sh_quote(zipPath) + " -d " + sh_quote(root);
+            const int rc = std::system(cmd.c_str());
             if (rc != 0) {
                 LOG_ERR("[voice] unzip failed (%d) for %s -> %s\n", rc, zipPath.c_str(), root.c_str());
                 return {};
             }
-
             std::ofstream f(ok.string());
             f << "from=" << zipPath << "\n";
         }
@@ -155,6 +197,7 @@ struct VoiceIO {
         return outDir.string();
     }
 
+    // Accepts a dir OR a zip. If a parent dir is given, pick the first child dir.
     static std::string ensure_model_dir(const std::string& path) {
         namespace fs = std::filesystem;
         if (path.empty()) return {};
@@ -167,49 +210,90 @@ struct VoiceIO {
     }
 
     // ---------- PortAudio device helpers ----------
+    static std::string to_lower(std::string s) {
+        for (char& c : s) c = (char)std::tolower((unsigned char)c);
+        return s;
+    }
+
     static void log_pa_devices() {
-        int n = Pa_GetDeviceCount();
+        const int n = Pa_GetDeviceCount();
         for (int i = 0; i < n; ++i) {
             const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
             const PaHostApiInfo* ai = di ? Pa_GetHostApiInfo(di->hostApi) : nullptr;
-            fprintf(stderr, "[audio] #%d api=%s in=%d out=%d name=%s (defaultSR=%.0f)\n",
-                    i, ai?ai->name:"?", di?di->maxInputChannels:0,
-                    di?di->maxOutputChannels:0, di && di->name ? di->name : "?",
-                    di?di->defaultSampleRate:0.0);
+            LOG_ERR("[audio] #%d api=%s in=%d out=%d name=%s\n",
+                    i, ai ? ai->name : "?", di ? di->maxInputChannels : 0,
+                    di ? di->maxOutputChannels : 0, (di && di->name) ? di->name : "?");
         }
     }
-    // pick by substring name (VOICE_IN_DEV as text), else by index (VOICE_IN_DEV as int)
+
+    // VOICE_IN_DEV can be numeric index (e.g., "0") or substring of device name ("SNIPER71")
     static int pick_input_device_from_env() {
-        const char* env = std::getenv("VOICE_IN_DEV");
-        if (env && *env) {
-            // try as integer index first
-            char* end=nullptr; long idx = std::strtol(env, &end, 10);
-            if (end && *end == '\0') {
-                if (idx >= 0 && idx < Pa_GetDeviceCount()) {
-                    const PaDeviceInfo* di = Pa_GetDeviceInfo((int)idx);
-                    if (di && di->maxInputChannels > 0) return (int)idx;
-                }
-            }
-            // substring match on name (or api+name)
-            std::string sub(env);
-            int n = Pa_GetDeviceCount();
+        std::string want = env_or("VOICE_IN_DEV", "");
+        const int n = Pa_GetDeviceCount();
+        if (want.empty()) {
+            // fallback: first with input channels
             for (int i = 0; i < n; ++i) {
                 const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
-                if (!di || di->maxInputChannels <= 0) continue;
-                const PaHostApiInfo* ai = Pa_GetHostApiInfo(di->hostApi);
-                std::string full = std::string(ai?ai->name:"") + " " + (di->name?di->name:"");
-                if (full.find(sub) != std::string::npos) return i;
+                if (di && di->maxInputChannels > 0) return i;
             }
+            return paNoDevice;
         }
-        // default input if available, else first input-capable
-        int dev = Pa_GetDefaultInputDevice();
-        if (dev != paNoDevice) return dev;
-        int n = Pa_GetDeviceCount();
+
+        // numeric?
+        char* end = nullptr;
+        long idx = std::strtol(want.c_str(), &end, 10);
+        if (end != want.c_str() && idx >= 0 && idx < n) {
+            const PaDeviceInfo* di = Pa_GetDeviceInfo((int)idx);
+            if (di && di->maxInputChannels > 0) return (int)idx;
+        }
+
+        // substring match (case-insensitive)
+        std::string wlc = to_lower(want);
         for (int i = 0; i < n; ++i) {
             const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
-            if (di && di->maxInputChannels > 0) return i;
+            if (!di || di->maxInputChannels <= 0) continue;
+            std::string name = di->name ? di->name : "";
+            if (to_lower(name).find(wlc) != std::string::npos) return i;
         }
         return paNoDevice;
+    }
+
+    // Try to open with requested rate; if not, try common rates; return actual opened rate
+    bool open_input_stream_choose_rate(int devIndex, double& openedRate) {
+        const PaDeviceInfo* di = Pa_GetDeviceInfo(devIndex);
+        if (!di) return false;
+
+        PaStreamParameters in{};
+        in.device = devIndex;
+        in.channelCount = channels;
+        in.sampleFormat = paInt16;
+        in.suggestedLatency = di->defaultLowInputLatency;
+
+        // candidate rates (first from env/desired)
+        std::vector<double> rates;
+        const int want = env_get_int("VOICE_RATE", srate);
+        rates.push_back((double)want);
+        // common fallbacks
+        for (double r : {44100.0, 48000.0, 32000.0, (di->defaultSampleRate > 0 ? di->defaultSampleRate : 0.0)}) {
+            if (r > 0.0 && std::find(rates.begin(), rates.end(), r) == rates.end()) rates.push_back(r);
+        }
+
+        for (double r : rates) {
+            if (Pa_IsFormatSupported(&in, nullptr, r) != paFormatIsSupported) continue;
+            PaError err = Pa_OpenStream(&pa_in, &in, nullptr, r, (unsigned long)framesPer, paNoFlag, nullptr, nullptr);
+            if (err == paNoError) {
+                openedRate = r;
+                return true;
+            }
+        }
+
+        // last ditch: try to open even if Pa_IsFormatSupported said no
+        for (double r : rates) {
+            PaError err = Pa_OpenStream(&pa_in, &in, nullptr, r, (unsigned long)framesPer, paNoFlag, nullptr, nullptr);
+            if (err == paNoError) { openedRate = r; return true; }
+        }
+
+        return false;
     }
 
     // ---------- TTS ----------
@@ -220,93 +304,71 @@ struct VoiceIO {
         espeak_SetParameter(espeakRATE, tts_rate_wpm, 0);
         return true;
     }
+
     void tts_say(const std::string& text) {
         if (text.empty()) return;
-        espeak_Synth(text.c_str(), text.size()+1, 0, POS_CHARACTER, 0, espeakCHARS_AUTO, nullptr, nullptr);
+        espeak_Synth(text.c_str(), text.size() + 1, 0, POS_CHARACTER, 0, espeakCHARS_AUTO, nullptr, nullptr);
         espeak_Synchronize();
     }
 
     // ---------- capture thread ----------
     void thread_fn() {
-        // pick device
+        // choose input device
         int dev = pick_input_device_from_env();
         if (dev == paNoDevice) {
-            LOG_ERR("[voice] No input device. Set VOICE_IN_DEV (index or substring).\n");
-            log_pa_devices();
-            return;
-        }
-        const PaDeviceInfo* di = Pa_GetDeviceInfo(dev);
-        if (!di) {
-            LOG_ERR("[voice] Invalid device index %d\n", dev);
-            return;
-        }
-
-        // build in params
-        PaStreamParameters in{}; in.device = dev;
-        in.channelCount     = std::min(channels, di->maxInputChannels);
-        in.sampleFormat     = paInt16;
-        in.suggestedLatency = di->defaultLowInputLatency;
-
-        // choose a rate the device supports in practice
-        int req = srate;
-        if (const char* e = std::getenv("VOICE_SRATE")) {
-            int r = std::atoi(e); if (r > 0) req = r;
-        } else if (di->defaultSampleRate > 0) {
-            req = (int)di->defaultSampleRate;
-        }
-
-        // Try requested → 48000 → 44100
-        PaError err = Pa_OpenStream(&pa_in, &in, nullptr, req, framesPer, paNoFlag, nullptr, nullptr);
-        if (err == paInvalidSampleRate || err == paSampleFormatNotSupported) {
-            int tries[] = { 48000, 44100 };
-            for (int r : tries) {
-                if (r == req) continue;
-                err = Pa_OpenStream(&pa_in, &in, nullptr, r, framesPer, paNoFlag, nullptr, nullptr);
-                if (err == paNoError) { req = r; break; }
-            }
-        }
-        if (err != paNoError) {
-            LOG_ERR("[voice] Pa_OpenStream(%s) failed: %s\n", di->name?di->name:"?", Pa_GetErrorText(err));
+            LOG_ERR("[voice] No input device found. Listing devices:\n");
             log_pa_devices();
             return;
         }
 
-        if ((err = Pa_StartStream(pa_in)) != paNoError) {
-            LOG_ERR("[voice] Pa_StartStream failed: %s\n", Pa_GetErrorText(err));
-            Pa_CloseStream(pa_in); pa_in = nullptr;
+        // open the stream at the best rate we can
+        if (!open_input_stream_choose_rate(dev, hw_rate)) {
+            const PaDeviceInfo* di = Pa_GetDeviceInfo(dev);
+            LOG_ERR("[voice] Pa_OpenStream(%s) failed for all tested rates. Devices:\n", di && di->name ? di->name : "?");
+            log_pa_devices();
             return;
         }
 
-        // actual sample rate
-        const PaStreamInfo *si = Pa_GetStreamInfo(pa_in);
-        int openedRate = (si && si->sampleRate > 0) ? (int)si->sampleRate : req;
-        srate = openedRate;
-
-        // create recognizer matching the opened rate
-        vrec = vosk_recognizer_new(vmodel, (float)srate);
-        if (!vrec) {
-            LOG_ERR("[voice] vosk_recognizer_new failed at %d Hz\n", srate);
-            Pa_StopStream(pa_in); Pa_CloseStream(pa_in); pa_in = nullptr;
+        // start stream
+        if (Pa_StartStream(pa_in) != paNoError) {
+            LOG_ERR("[voice] Pa_StartStream failed\n");
+            Pa_CloseStream(pa_in);
+            pa_in = nullptr;
             return;
         }
 
-        std::vector<int16_t> buf(framesPer);
+        // prepare resampler if needed
+        const bool need_resample = (std::llround(hw_rate) != srate);
+        if (need_resample) resampler.reset((int)std::llround(hw_rate), srate);
+
+        std::vector<int16_t> inbuf((size_t)framesPer);
+        std::vector<int16_t> rsbuf;
+        rsbuf.reserve((size_t)((framesPer * srate) / std::max(1.0, hw_rate)) + 8);
+
         while (running) {
-            err = Pa_ReadStream(pa_in, buf.data(), (unsigned long)buf.size());
+            PaError err = Pa_ReadStream(pa_in, inbuf.data(), (unsigned long)inbuf.size());
             if (err == paInputOverflowed) continue;
             if (err != paNoError) { Pa_Sleep(10); continue; }
 
-            vosk_recognizer_accept_waveform(vrec, (const char*)buf.data(),
-                                            (int)(buf.size()*sizeof(int16_t)));
+            if (need_resample) {
+                rsbuf.clear();
+                resampler.process(inbuf.data(), inbuf.size(), rsbuf);
+                if (!rsbuf.empty()) {
+                    vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf.data(), (int)(rsbuf.size() * sizeof(int16_t)));
+                }
+            } else {
+                vosk_recognizer_accept_waveform(vrec, (const char*)inbuf.data(), (int)(inbuf.size() * sizeof(int16_t)));
+            }
 
-            if (const char* rj = vosk_recognizer_result(vrec)) {
-                if (rj[0]) {
-                    std::string txt = jget(rj, "text");
-                    if (!txt.empty()) {
+            if (const char* rj = vosk_recognizer_result(vrec); rj && rj[0]) {
+                std::string js(rj);
+                std::string txt = jget(js, "text");
+                if (!txt.empty()) {
+                    {
                         std::lock_guard<std::mutex> lk(mu);
                         q.push(txt);
-                        cv.notify_one();
                     }
+                    cv.notify_one();
                 }
             }
         }
@@ -316,29 +378,40 @@ struct VoiceIO {
             Pa_CloseStream(pa_in);
             pa_in = nullptr;
         }
-        if (vrec) { vosk_recognizer_free(vrec); vrec = nullptr; }
     }
 
     // ---------- lifecycle ----------
     bool init() {
-        // Prepare model dir (accept dir or .zip)
+        // env overrides
+        srate     = env_get_int("VOICE_RATE",    srate);
+        channels  = env_get_int("VOICE_CHANNELS", channels);
+        framesPer = env_get_int("VOICE_FRAMES",  framesPer);
+
+        // TTS voice override
+        std::string tts_v = env_or("ESPEAK_VOICE", "");
+        if (!tts_v.empty()) tts_voice = tts_v;
+
+        // Vosk model (dir or zip)
         std::string model_path = env_or("VOSK_MODEL", VOSK_DEFAULT_MODEL_PATH);
         if (model_path.empty()) model_path = env_or("VOSK_MODEL_DIR", "");
         if (model_path.empty()) model_path = env_or("VOSK_MODEL_ZIP", "");
-
-        if (auto v = env_or("ESPEAK_VOICE", ""); !v.empty()) tts_voice = v;
-
         std::string model_dir = ensure_model_dir(model_path);
         if (model_dir.empty()) {
-            LOG_ERR("[voice] cannot prepare Vosk model path from: %s\n", model_path.c_str());
+            LOG_ERR("[voice] cannot prepare vosk model from path: %s\n", model_path.c_str());
             return false;
         }
 
         vosk_set_log_level(-1);
-
         vmodel = vosk_model_new(model_dir.c_str());
         if (!vmodel) {
-            LOG_ERR("[voice] cannot load Vosk model at %s\n", model_dir.c_str());
+            LOG_ERR("[voice] cannot load vosk model at %s\n", model_dir.c_str());
+            return false;
+        }
+
+        // recognizer always at target 16 kHz
+        vrec = vosk_recognizer_new(vmodel, (float)srate);
+        if (!vrec) {
+            LOG_ERR("[voice] cannot create recognizer\n");
             return false;
         }
 
