@@ -43,6 +43,8 @@
 #include <algorithm>
 #include <filesystem>
 #include <chrono>
+#include <deque>
+#include <cmath>
 
 #include <portaudio.h>
 #include <vosk_api.h>
@@ -67,7 +69,7 @@ struct VoiceIO {
     int         framesPer    = 512;     // PortAudio frames per buffer
     std::string tts_voice    = "en-us";
     int         tts_rate_wpm = 170;
-    bool tts_enabled = true;
+    bool        tts_enabled  = true;
 
     // ---------- runtime ----------
     std::atomic<bool> running{false};
@@ -138,6 +140,12 @@ struct VoiceIO {
         if (!v || !*v) return defv;
         char* end = nullptr; long x = std::strtol(v, &end, 10);
         return (end == v) ? defv : (int)x;
+    }
+    static float env_get_float(const char* name, float defv) {
+        const char* v = std::getenv(name);
+        if (!v || !*v) return defv;
+        char* end = nullptr; float x = std::strtof(v, &end);
+        return (end == v) ? defv : x;
     }
     static bool ends_with(const std::string& s, const char* suf) {
         size_t n = s.size(), m = std::char_traits<char>::length(suf);
@@ -222,7 +230,6 @@ struct VoiceIO {
         std::string want = env_or("VOICE_IN_DEV", "");
         const int n = Pa_GetDeviceCount();
 
-        // remember first input-capable device as a guaranteed fallback
         int first_in = paNoDevice;
         for (int i = 0; i < n; ++i) {
             const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
@@ -238,7 +245,7 @@ struct VoiceIO {
             if (di && di->maxInputChannels > 0) return (int)idx;
         }
 
-        // fuzzy substring: ignore case and non-alnum (so "SNIPER71" matches "SNIPER7.1")
+        // fuzzy substring
         std::string w = norm(want);
         for (int i = 0; i < n; ++i) {
             const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
@@ -247,7 +254,6 @@ struct VoiceIO {
             if (norm(name).find(w) != std::string::npos) return i;
         }
 
-        // fallback so we never return "no device"
         return first_in;
     }
 
@@ -270,7 +276,7 @@ struct VoiceIO {
             if (std::find(rates.begin(), rates.end(), r) == rates.end()) rates.push_back(r);
         }
 
-        // Do NOT pre-validate with Pa_IsFormatSupported (it often rejects plug/asym)
+        // Do NOT pre-validate with Pa_IsFormatSupported; open directly (plug/asym often fail validation)
         for (double r : rates) {
             PaError err = Pa_OpenStream(&pa_in, &in, nullptr, r, (unsigned long)framesPer, paNoFlag, nullptr, nullptr);
             if (err == paNoError) { openedRate = r; return true; }
@@ -278,6 +284,75 @@ struct VoiceIO {
         }
         return false;
     }
+
+    // ---------- VAD (simple energy-based, adaptive noise floor) ----------
+    struct VAD {
+        int   sr            = 16000;  // sample rate of the audio we feed to Vosk
+        int   pre_ms        = 200;    // pre-roll to keep before speech start
+        float margin_db     = 10.0f;  // how many dB above noise floor counts as speech
+        int   start_frames  = 3;      // consecutive “speech” frames to trigger start
+        int   hang_frames   = 12;     // consecutive “silence” frames to trigger end
+        float noise_db      = -60.0f; // adaptive noise estimate (dB FS)
+        float alpha         = 0.05f;  // noise EMA speed
+
+        std::deque<int16_t> preroll;  // ring buffer of pre-roll audio
+        bool speaking = false;
+        int  above = 0, below = 0;
+
+        void reset(int sr_) {
+            sr = sr_;
+            preroll.clear();
+            speaking = false;
+            above = below = 0;
+            noise_db = -60.0f;
+        }
+        int preroll_nsamp() const { return (pre_ms * sr) / 1000; }
+
+        static float level_db(const int16_t* p, int n) {
+            if (n <= 0) return -120.0f;
+            double s = 0.0;
+            for (int i = 0; i < n; ++i) {
+                float v = p[i] / 32768.0f;
+                s += double(v) * double(v);
+            }
+            float rms = std::sqrt(s / std::max(1, n));
+            return (rms > 1e-6f) ? 20.0f * std::log10(rms) : -120.0f;
+        }
+
+        void add_preroll(const int16_t* p, int n) {
+            for (int i = 0; i < n; ++i) preroll.push_back(p[i]);
+            int keep = preroll_nsamp();
+            while ((int)preroll.size() > keep) preroll.pop_front();
+        }
+        void drain_preroll(std::vector<int16_t>& out) {
+            out.reserve(out.size() + preroll.size());
+            while (!preroll.empty()) { out.push_back(preroll.front()); preroll.pop_front(); }
+        }
+
+        // Update VAD with one frame (block) and return current speaking state after update
+        bool update(const int16_t* p, int n) {
+            const float db = level_db(p, n);
+
+            // Update noise estimate when not clearly “far above” threshold
+            if (!speaking || db < noise_db + margin_db * 0.5f) {
+                noise_db = (1.0f - alpha) * noise_db + alpha * db;
+                if (noise_db > -20.0f) noise_db = -20.0f; // clamp upper bound
+            }
+
+            if (db >= noise_db + margin_db) { above++; below = 0; }
+            else                            { below++; above = 0; }
+
+            if (!speaking && above >= start_frames) {
+                speaking = true; above = below = 0;
+            } else if (speaking && below >= hang_frames) {
+                speaking = false; above = below = 0;
+            }
+            return speaking;
+        }
+    };
+
+    bool vad_enabled = true;
+    VAD  vad;
 
     // ---------- TTS ----------
     bool tts_init() {
@@ -293,7 +368,7 @@ struct VoiceIO {
         return true;
     }
     void tts_say(const std::string& text) {
-        if (text.empty()) return;
+        if (!tts_enabled || text.empty()) return;
         espeak_Synth(text.c_str(), text.size() + 1, 0, POS_CHARACTER, 0, espeakCHARS_AUTO, nullptr, nullptr);
         espeak_Synchronize();
     }
@@ -323,33 +398,88 @@ struct VoiceIO {
             int inr = (int)(hw_rate + (hw_rate >= 0 ? 0.5 : -0.5));
             resampler.reset(inr, srate);
         }
+        vad.reset(srate);
 
         std::vector<int16_t> inbuf((size_t)framesPer);
         std::vector<int16_t> rsbuf; rsbuf.reserve(framesPer * 2);
+        std::vector<int16_t> tmp;
+
+        bool was_speaking = false;
 
         while (running) {
             PaError err = Pa_ReadStream(pa_in, inbuf.data(), (unsigned long)inbuf.size());
-            if (err == paInputOverflowed) { Pa_Sleep(1); continue; }
+            if (err == paInputOverflowed) { Pa_Sleep(1);  continue; }
             if (err != paNoError)         { Pa_Sleep(10); continue; }
+
+            // Choose the buffer we’ll analyze/forward (16 kHz mono expected by Vosk)
+            const int16_t* data = nullptr;
+            int            ns   = 0;
 
             if (need_resample) {
                 rsbuf.clear();
                 resampler.process(inbuf.data(), inbuf.size(), rsbuf);
-                if (!rsbuf.empty()) {
-                    vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf.data(), (int)(rsbuf.size() * sizeof(int16_t)));
-                }
+                if (rsbuf.empty()) continue;
+                data = rsbuf.data();
+                ns   = (int)rsbuf.size();
             } else {
-                vosk_recognizer_accept_waveform(vrec, (const char*)inbuf.data(), (int)(inbuf.size() * sizeof(int16_t)));
+                data = inbuf.data();
+                ns   = (int)inbuf.size();
             }
 
-            if (const char* rj = vosk_recognizer_result(vrec); rj && rj[0]) {
-                std::string js(rj);
-                std::string txt = jget(js, "text");
-                if (!txt.empty()) {
-                    { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
-                    cv.notify_one();
+            if (!vad_enabled) {
+                // Old behavior: always stream; push final results when available
+                (void)vosk_recognizer_accept_waveform(vrec, (const char*)data, ns * (int)sizeof(int16_t));
+                if (const char* rj = vosk_recognizer_result(vrec); rj && rj[0]) {
+                    std::string js(rj);
+                    std::string txt = jget(js, "text");
+                    if (!txt.empty()) {
+                        { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
+                        cv.notify_one();
+                    }
                 }
+                continue;
             }
+
+            // VAD gating: only stream while speaking, collect one final utterance at end
+            vad.add_preroll(data, ns);
+            bool speaking_now = vad.update(data, ns);
+
+            if (!was_speaking && speaking_now) {
+                // Start-of-speech: feed preroll first so we don’t clip initial words
+                tmp.clear();
+                vad.drain_preroll(tmp);
+                if (!tmp.empty()) {
+                    (void)vosk_recognizer_accept_waveform(vrec, (const char*)tmp.data(), (int)tmp.size() * (int)sizeof(int16_t));
+                }
+                (void)vosk_recognizer_accept_waveform(vrec, (const char*)data, ns * (int)sizeof(int16_t));
+            } else if (speaking_now) {
+                // In speech: keep feeding
+                (void)vosk_recognizer_accept_waveform(vrec, (const char*)data, ns * (int)sizeof(int16_t));
+            } else if (was_speaking && !speaking_now) {
+                // End-of-speech: force finalize and emit a single full utterance
+                if (const char* fj = vosk_recognizer_final_result(vrec); fj && fj[0]) {
+                    std::string js(fj);
+                    std::string txt = jget(js, "text");
+                    if (!txt.empty()) {
+                        { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
+                        cv.notify_one();
+                    }
+                } else {
+                    // Fallback: try normal result if final is empty
+                    if (const char* rj = vosk_recognizer_result(vrec); rj && rj[0]) {
+                        std::string js(rj);
+                        std::string txt = jget(js, "text");
+                        if (!txt.empty()) {
+                            { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
+                            cv.notify_one();
+                        }
+                    }
+                }
+                // Prepare recognizer for the next utterance
+                vosk_recognizer_reset(vrec);
+            }
+
+            was_speaking = speaking_now;
         }
 
         if (pa_in) {
@@ -367,6 +497,12 @@ struct VoiceIO {
 
         std::string tts_v = env_or("ESPEAK_VOICE", "");
         if (!tts_v.empty()) tts_voice = tts_v;
+
+        vad_enabled       = env_get_int  ("VOICE_VAD", 1) != 0;
+        vad.margin_db     = env_get_float("VOICE_VAD_MARGIN_DB", 10.0f);
+        vad.start_frames  = env_get_int  ("VOICE_VAD_START_FRAMES", 3);
+        vad.hang_frames   = env_get_int  ("VOICE_VAD_HANG_FRAMES", 12);
+        vad.pre_ms        = env_get_int  ("VOICE_VAD_PRE_MS", 200);
 
         std::string model_path = env_or("VOSK_MODEL", VOSK_DEFAULT_MODEL_PATH);
         if (model_path.empty()) model_path = env_or("VOSK_MODEL_DIR", "");
@@ -1250,7 +1386,7 @@ int main(int argc, char ** argv) {
 
                 std::string buffer;
 #ifdef HAVE_VOICE_IO
-                // block until we get a final utterance from Vosk
+                // block until we get a final utterance from Vosk (after VAD end)
                 buffer = g_voice.wait_utt();
                 LOG_INF("%s/no_think\n", buffer.c_str());
 #else
@@ -1280,10 +1416,6 @@ int main(int argc, char ** argv) {
                 }
 
                 if (buffer.back() == '\n') {
-                    // Implement #587:
-                    // If the user wants the text to end in a newline,
-                    // this should be accomplished by explicitly adding a newline by using \ followed by return,
-                    // then returning control by pressing return again.
                     buffer.pop_back();
                 }
 #endif
