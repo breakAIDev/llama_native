@@ -62,17 +62,17 @@
 
 struct VoiceIO {
     // ---------- config (overridable via env) ----------
-    int         srate        = 16000;   // target rate for Vosk
-    int         channels     = 1;
-    int         framesPer    = 512;
+    int         srate        = 16000;   // recognizer target rate
+    int         channels     = 1;       // input channels (Vosk likes mono)
+    int         framesPer    = 512;     // PortAudio frames per buffer
     std::string tts_voice    = "en-us";
     int         tts_rate_wpm = 170;
 
-    // ---------- runtime state ----------
+    // ---------- runtime ----------
     std::atomic<bool> running{false};
     std::thread       th;
     PaStream*         pa_in   = nullptr;
-    double            hw_rate = 0.0;    // actual device rate
+    double            hw_rate = 0.0;
 
     VoskModel*        vmodel = nullptr;
     VoskRecognizer*   vrec   = nullptr;
@@ -81,35 +81,28 @@ struct VoiceIO {
     std::mutex              mu;
     std::condition_variable cv;
 
-    // ---------- tiny round+clamp helpers (avoid std::llround / lrintf) ----------
+    // ---------- tiny helpers ----------
     static inline int16_t s16_round_clamp(float x) {
-        // round to nearest int and clamp to int16 range
         x = (x >= 0.0f) ? (x + 0.5f) : (x - 0.5f);
         if (x >  32767.0f) x =  32767.0f;
         if (x < -32768.0f) x = -32768.0f;
         return (int16_t)x;
     }
     static inline bool approx_ne(double a, double b, double eps = 1e-6) {
-        double d = a - b;
-        if (d < 0) d = -d;
-        return d <= eps;
+        double d = a - b; if (d < 0) d = -d;
+        return d > eps;
     }
 
-    // ---------- simple linear resampler (block-continuous) ----------
     struct Resampler {
         int     in_rate  = 0;
         int     out_rate = 0;
-        double  pos      = 0.0;      // fractional input index for next out sample
-        int16_t last     = 0;        // last sample from previous block for continuity
+        double  pos      = 0.0;
+        int16_t last     = 0;
 
         void reset(int inr, int outr) {
-            in_rate  = inr;
-            out_rate = outr;
-            pos = 0.0;
-            last = 0;
+            in_rate  = inr; out_rate = outr;
+            pos = 0.0; last = 0;
         }
-
-        // Append resampled data into 'out'
         void process(const int16_t* in, size_t n_in, std::vector<int16_t>& out) {
             if (n_in == 0) return;
             if (in_rate <= 0 || out_rate <= 0 || in_rate == out_rate) {
@@ -117,27 +110,24 @@ struct VoiceIO {
                 last = in[n_in - 1];
                 return;
             }
-
             const double step = (double)in_rate / (double)out_rate;
             double p = pos;
-
             while (true) {
-                size_t idx1 = (size_t)p;      // next input index
+                size_t idx1 = (size_t)p;
                 if (idx1 >= n_in) break;
                 const double a  = p - (double)idx1;
                 const int16_t s1 = in[idx1];
                 const int16_t s0 = (idx1 == 0) ? last : in[idx1 - 1];
-                const float sample = (float)((1.0 - a) * (double)s0 + a * (double)s1);
+                const float sample = (float)((1.0 - a)*(double)s0 + a*(double)s1);
                 out.push_back(VoiceIO::s16_round_clamp(sample));
                 p += step;
             }
-
             last = in[n_in - 1];
-            pos  = p - (double)n_in; // keep fractional remainder for next block
+            pos  = p - (double)n_in;
         }
     } resampler;
 
-    // ---------- helpers ----------
+    // ---------- misc helpers ----------
     static std::string env_or(const char* name, const char* fallback) {
         const char* v = std::getenv(name);
         return (v && *v) ? std::string(v) : std::string(fallback ? fallback : "");
@@ -145,8 +135,7 @@ struct VoiceIO {
     static int env_get_int(const char* name, int defv) {
         const char* v = std::getenv(name);
         if (!v || !*v) return defv;
-        char* end = nullptr;
-        long x = std::strtol(v, &end, 10);
+        char* end = nullptr; long x = std::strtol(v, &end, 10);
         return (end == v) ? defv : (int)x;
     }
     static bool ends_with(const std::string& s, const char* suf) {
@@ -154,10 +143,8 @@ struct VoiceIO {
         return n >= m && s.compare(n - m, m, suf) == 0;
     }
     static std::string sh_quote(const std::string& p) {
-        std::string out = "'";
-        for (char c : p) out += (c == '\'') ? "'\"'\"'" : std::string(1, c);
-        out += "'";
-        return out;
+        std::string out = "'"; for (char c : p) out += (c=='\'') ? "'\"'\"'" : std::string(1,c);
+        out += "'"; return out;
     }
     static bool dir_nonempty(const std::filesystem::path& d) {
         namespace fs = std::filesystem;
@@ -174,7 +161,6 @@ struct VoiceIO {
         return s.substr(p + 1, e - p - 1);
     }
 
-    // unzip model.zip to cache dir; return folder that contains the model
     static std::string unzip_to_cache(const std::string& zipPath) {
         namespace fs = std::filesystem;
         std::string base = zipPath;
@@ -196,26 +182,20 @@ struct VoiceIO {
                 LOG_ERR("[voice] unzip failed (%d) for %s -> %s\n", rc, zipPath.c_str(), root.c_str());
                 return {};
             }
-            std::ofstream f(ok.string());
-            f << "from=" << zipPath << "\n";
+            std::ofstream f(ok.string()); f << "from=" << zipPath << "\n";
         }
-
         return outDir.string();
     }
-
-    // Accepts a dir OR a zip. If a parent dir is given, pick the first child dir.
     static std::string ensure_model_dir(const std::string& path) {
         namespace fs = std::filesystem;
         if (path.empty()) return {};
         fs::path p(path);
         if (fs::exists(p) && fs::is_directory(p)) return path;
-        if (fs::exists(p) && fs::is_regular_file(p) && ends_with(path, ".zip")) {
-            return unzip_to_cache(path);
-        }
+        if (fs::exists(p) && fs::is_regular_file(p) && ends_with(path, ".zip")) return unzip_to_cache(path);
         return {};
     }
 
-    // ---------- PortAudio device helpers ----------
+    // ---------- PortAudio device ----------
     static std::string to_lower(std::string s) {
         for (char& c : s) c = (char)std::tolower((unsigned char)c);
         return s;
@@ -230,7 +210,6 @@ struct VoiceIO {
                     di ? di->maxOutputChannels : 0, (di && di->name) ? di->name : "?");
         }
     }
-    // VOICE_IN_DEV can be numeric index or substring of device name
     static int pick_input_device_from_env() {
         std::string want = env_or("VOICE_IN_DEV", "");
         const int n = Pa_GetDeviceCount();
@@ -241,14 +220,11 @@ struct VoiceIO {
             }
             return paNoDevice;
         }
-        // numeric?
-        char* end = nullptr;
-        long idx = std::strtol(want.c_str(), &end, 10);
+        char* end = nullptr; long idx = std::strtol(want.c_str(), &end, 10);
         if (end != want.c_str() && idx >= 0 && idx < n) {
             const PaDeviceInfo* di = Pa_GetDeviceInfo((int)idx);
             if (di && di->maxInputChannels > 0) return (int)idx;
         }
-        // substring
         std::string wlc = to_lower(want);
         for (int i = 0; i < n; ++i) {
             const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
@@ -258,6 +234,7 @@ struct VoiceIO {
         }
         return paNoDevice;
     }
+
     bool open_input_stream_choose_rate(int devIndex, double& openedRate) {
         const PaDeviceInfo* di = Pa_GetDeviceInfo(devIndex);
         if (!di) return false;
@@ -268,29 +245,33 @@ struct VoiceIO {
         in.sampleFormat = paInt16;
         in.suggestedLatency = di->defaultLowInputLatency;
 
+        // Try requested rate first, then safe fallbacks
         std::vector<double> rates;
         const int want = env_get_int("VOICE_RATE", srate);
         rates.push_back((double)want);
-        for (double r : {44100.0, 48000.0, 32000.0, (di->defaultSampleRate > 0 ? di->defaultSampleRate : 0.0)}) {
-            if (r > 0.0 && std::find(rates.begin(), rates.end(), r) == rates.end()) rates.push_back(r);
+        if (di->defaultSampleRate > 0) rates.push_back(di->defaultSampleRate);
+        for (double r : {48000.0, 44100.0, 32000.0, 24000.0, 16000.0}) {
+            if (std::find(rates.begin(), rates.end(), r) == rates.end()) rates.push_back(r);
         }
 
-        for (double r : rates) {
-            if (Pa_IsFormatSupported(&in, nullptr, r) != paFormatIsSupported) continue;
-            PaError err = Pa_OpenStream(&pa_in, &in, nullptr, r, (unsigned long)framesPer, paNoFlag, nullptr, nullptr);
-            if (err == paNoError) { openedRate = r; return true; }
-        }
+        // Do NOT pre-validate with Pa_IsFormatSupported (it often rejects plug/asym)
         for (double r : rates) {
             PaError err = Pa_OpenStream(&pa_in, &in, nullptr, r, (unsigned long)framesPer, paNoFlag, nullptr, nullptr);
             if (err == paNoError) { openedRate = r; return true; }
+            LOG_ERR("[voice] Pa_OpenStream(in) @%.0f Hz failed: %s\n", r, Pa_GetErrorText(err));
         }
         return false;
     }
 
     // ---------- TTS ----------
     bool tts_init() {
+        // Force eSpeak NG to ALSA backend so it doesn’t fight with PortAudio/ALSA rate limits
+        setenv("ESPEAKNG_AUDIO_OUTPUT", "alsa", 1);     // valid in espeak-ng
+        setenv("ESPEAKNG_PLAYBACK_DEVICE", "default", 1);
+
         int sr = espeak_Initialize(AUDIO_OUTPUT_PLAYBACK, 0, nullptr, 0);
         if (sr <= 0) return false;
+
         espeak_SetVoiceByName(tts_voice.c_str());
         espeak_SetParameter(espeakRATE, tts_rate_wpm, 0);
         return true;
@@ -311,28 +292,29 @@ struct VoiceIO {
         }
         if (!open_input_stream_choose_rate(dev, hw_rate)) {
             const PaDeviceInfo* di = Pa_GetDeviceInfo(dev);
-            LOG_ERR("[voice] Pa_OpenStream(%s) failed for all tested rates. Devices:\n", di && di->name ? di->name : "?");
+            LOG_ERR("[voice] input open failed for device: %s\n", di && di->name ? di->name : "?");
             log_pa_devices();
             return;
         }
         if (Pa_StartStream(pa_in) != paNoError) {
             LOG_ERR("[voice] Pa_StartStream failed\n");
-            Pa_CloseStream(pa_in);
-            pa_in = nullptr;
+            Pa_CloseStream(pa_in); pa_in = nullptr;
             return;
         }
 
-        const bool need_resample = !approx_ne(hw_rate, (double)srate);
-        if (need_resample) resampler.reset((int)(hw_rate + (hw_rate >= 0 ? 0.5 : -0.5)), srate);
+        const bool need_resample = approx_ne(hw_rate, (double)srate);
+        if (need_resample) {
+            int inr = (int)(hw_rate + (hw_rate >= 0 ? 0.5 : -0.5));
+            resampler.reset(inr, srate);
+        }
 
         std::vector<int16_t> inbuf((size_t)framesPer);
-        std::vector<int16_t> rsbuf;
-        rsbuf.reserve((size_t)((framesPer * std::max(1, srate)) / (hw_rate > 0 ? hw_rate : srate)) + 8);
+        std::vector<int16_t> rsbuf; rsbuf.reserve(framesPer * 2);
 
         while (running) {
             PaError err = Pa_ReadStream(pa_in, inbuf.data(), (unsigned long)inbuf.size());
-            if (err == paInputOverflowed) continue;
-            if (err != paNoError) { Pa_Sleep(10); continue; }
+            if (err == paInputOverflowed) { Pa_Sleep(1); continue; }
+            if (err != paNoError)         { Pa_Sleep(10); continue; }
 
             if (need_resample) {
                 rsbuf.clear();
@@ -363,9 +345,9 @@ struct VoiceIO {
 
     // ---------- lifecycle ----------
     bool init() {
-        srate     = env_get_int("VOICE_RATE",    srate);
+        srate     = env_get_int("VOICE_RATE",     srate);
         channels  = env_get_int("VOICE_CHANNELS", channels);
-        framesPer = env_get_int("VOICE_FRAMES",  framesPer);
+        framesPer = env_get_int("VOICE_FRAMES",   framesPer);
 
         std::string tts_v = env_or("ESPEAK_VOICE", "");
         if (!tts_v.empty()) tts_voice = tts_v;
@@ -381,23 +363,17 @@ struct VoiceIO {
 
         vosk_set_log_level(-1);
         vmodel = vosk_model_new(model_dir.c_str());
-        if (!vmodel) {
-            LOG_ERR("[voice] cannot load vosk model at %s\n", model_dir.c_str());
-            return false;
-        }
+        if (!vmodel) { LOG_ERR("[voice] cannot load vosk model at %s\n", model_dir.c_str()); return false; }
         vrec = vosk_recognizer_new(vmodel, (float)srate);
-        if (!vrec) {
-            LOG_ERR("[voice] cannot create recognizer\n");
-            return false;
-        }
+        if (!vrec)  { LOG_ERR("[voice] cannot create recognizer\n"); return false; }
 
         if (Pa_Initialize() != paNoError) {
             LOG_ERR("[voice] PortAudio init failed\n");
             return false;
         }
         if (!tts_init()) {
-            LOG_ERR("[voice] eSpeak NG init failed\n");
-            return false;
+            LOG_ERR("[voice] eSpeak NG init failed (check ESPEAKNG backend)\n");
+            // not fatal for STT; keep going
         }
 
         running = true;
@@ -416,8 +392,7 @@ struct VoiceIO {
     std::string wait_utt() {
         std::unique_lock<std::mutex> lk(mu);
         cv.wait(lk, [&]{ return !q.empty(); });
-        std::string s = std::move(q.front());
-        q.pop();
+        std::string s = std::move(q.front()); q.pop();
         return s;
     }
 };
