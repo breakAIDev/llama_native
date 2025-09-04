@@ -1252,7 +1252,7 @@ int main(int argc, char ** argv) {
 #ifdef HAVE_VOICE_IO
                 // block until we get a final utterance from Vosk
                 buffer = g_voice.wait_utt();
-                LOG_INF("[mic] %s\n", buffer.c_str());
+                LOG_INF("%s/no_think\n", buffer.c_str());
 #else
                 if (!params.input_prefix.empty() && !params.conversation_mode) {
                     LOG_DBG("appending input prefix: '%s'\n", params.input_prefix.c_str());
