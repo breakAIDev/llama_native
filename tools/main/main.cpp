@@ -278,7 +278,7 @@ struct VoiceIO {
         for (int r : rates) {
             PaError err = Pa_OpenStream(&pa_in, &in, nullptr, (double)r, (unsigned long)framesPer, paClipOff, nullptr, nullptr);
             if (err == paNoError) { openedRate = r; return true; }
-            LOG_ERR("[voice] Pa_OpenStream(in) @%.0f Hz failed: %s\n", r, Pa_GetErrorText(err));
+            LOG_ERR("[voice] Pa_OpenStream(in) @%d Hz failed: %s\n", r, Pa_GetErrorText(err));
         }
         return false;
     }
@@ -379,16 +379,13 @@ struct VoiceIO {
         return true;
     }
 
-    // small helper to shell-quote (you already have sh_quote() above; reuse it)
-    static std::string q(const std::string& s) { return sh_quote(s); }
-
     void tts_say(const std::string& text) {
         if (!tts_enabled || text.empty()) return;
 
         bool stopped = false;
 
         if (tts_pause_mic) {
-            std::lock_guard<std::mutex> lk(pa_mu);
+            std::lock_guard<std::mutex> lk(mu);
             if (pa_in && Pa_IsStreamActive(pa_in) == 1) {
                 Pa_StopStream(pa_in);
                 stopped = true;
@@ -399,8 +396,8 @@ struct VoiceIO {
             // No ALSA backend in espeak-ng? Pipe to aplay on the target device.
             // Note: we avoid any shell injection by quoting the user text.
             const std::string cmd =
-                "espeak -v " + q(tts_voice) + " -s " + std::to_string(tts_rate_wpm) +
-                " --stdout " + q(text) + " | aplay -q -D default";
+                "espeak -v " + sh_quote(tts_voice) + " -s " + std::to_string(tts_rate_wpm) +
+                " --stdout " + sh_quote(text) + " | aplay -q -D default";
             int rc = std::system(cmd.c_str());
             if (rc != 0) {
                 LOG_ERR("[voice] tts fallback via aplay failed rc=%d\n", rc);
@@ -412,7 +409,7 @@ struct VoiceIO {
         }
 
         if (stopped) {
-            std::lock_guard<std::mutex> lk(pa_mu);
+            std::lock_guard<std::mutex> lk(mu);
             if (pa_in && Pa_IsStreamStopped(pa_in) == 1) {
                 Pa_StartStream(pa_in);
             }
