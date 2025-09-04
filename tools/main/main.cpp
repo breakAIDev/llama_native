@@ -64,9 +64,9 @@
 
 struct VoiceIO {
     // ---------- config (overridable via env) ----------
-    int         srate        = 16000;   // recognizer target rate
+    int         srate        = 44100;   // recognizer target rate
     int         channels     = 1;       // input channels (Vosk likes mono)
-    int         framesPer    = 512;     // PortAudio frames per buffer
+    int         framesPer    = 1024;     // PortAudio frames per buffer
     std::string tts_voice    = "en-us";
     int         tts_rate_wpm = 170;
     bool        tts_enabled  = true;
@@ -75,7 +75,7 @@ struct VoiceIO {
     std::atomic<bool> running{false};
     std::thread       th;
     PaStream*         pa_in   = nullptr;
-    double            hw_rate = 0.0;
+    int               hw_rate = 0;
 
     VoskModel*        vmodel = nullptr;
     VoskRecognizer*   vrec   = nullptr;
@@ -83,6 +83,8 @@ struct VoiceIO {
     std::queue<std::string> q;
     std::mutex              mu;
     std::condition_variable cv;
+    bool            tts_pause_mic = true;    // pause capture while speaking (override by env)
+    bool            tts_use_aplay_fallback = false; // optional fallback
 
     // ---------- tiny helpers ----------
     static inline int16_t s16_round_clamp(float x) {
@@ -90,10 +92,6 @@ struct VoiceIO {
         if (x >  32767.0f) x =  32767.0f;
         if (x < -32768.0f) x = -32768.0f;
         return (int16_t)x;
-    }
-    static inline bool approx_ne(double a, double b, double eps = 1e-6) {
-        double d = a - b; if (d < 0) d = -d;
-        return d > eps;
     }
 
     struct Resampler {
@@ -257,7 +255,7 @@ struct VoiceIO {
         return first_in;
     }
 
-    bool open_input_stream_choose_rate(int devIndex, double& openedRate) {
+    bool open_input_stream_choose_rate(int devIndex, int& openedRate) {
         const PaDeviceInfo* di = Pa_GetDeviceInfo(devIndex);
         if (!di) return false;
 
@@ -268,17 +266,17 @@ struct VoiceIO {
         in.suggestedLatency = di->defaultLowInputLatency;
 
         // Try requested rate first, then safe fallbacks
-        std::vector<double> rates;
+        std::vector<int> rates;
         const int want = env_get_int("VOICE_RATE", srate);
-        rates.push_back((double)want);
-        if (di->defaultSampleRate > 0) rates.push_back(di->defaultSampleRate);
-        for (double r : {48000.0, 44100.0, 32000.0, 24000.0, 16000.0}) {
+        rates.push_back(want);
+        if (di->defaultSampleRate > 0) rates.push_back((int)di->defaultSampleRate);
+        for (int r : {48000, 44100, 32000, 24000, 16000}) {
             if (std::find(rates.begin(), rates.end(), r) == rates.end()) rates.push_back(r);
         }
 
         // Do NOT pre-validate with Pa_IsFormatSupported; open directly (plug/asym often fail validation)
-        for (double r : rates) {
-            PaError err = Pa_OpenStream(&pa_in, &in, nullptr, r, (unsigned long)framesPer, paNoFlag, nullptr, nullptr);
+        for (int r : rates) {
+            PaError err = Pa_OpenStream(&pa_in, &in, nullptr, (double)r, (unsigned long)framesPer, paClipOff, nullptr, nullptr);
             if (err == paNoError) { openedRate = r; return true; }
             LOG_ERR("[voice] Pa_OpenStream(in) @%.0f Hz failed: %s\n", r, Pa_GetErrorText(err));
         }
@@ -288,10 +286,10 @@ struct VoiceIO {
     // ---------- VAD (simple energy-based, adaptive noise floor) ----------
     struct VAD {
         int   sr            = 16000;  // sample rate of the audio we feed to Vosk
-        int   pre_ms        = 200;    // pre-roll to keep before speech start
-        float margin_db     = 10.0f;  // how many dB above noise floor counts as speech
-        int   start_frames  = 3;      // consecutive “speech” frames to trigger start
-        int   hang_frames   = 12;     // consecutive “silence” frames to trigger end
+        int   pre_ms        = 300;    // pre-roll to keep before speech start
+        float margin_db     = 12.0f;  // how many dB above noise floor counts as speech
+        int   start_frames  = 6;      // consecutive “speech” frames to trigger start
+        int   hang_frames   = 40;     // consecutive “silence” frames to trigger end
         float noise_db      = -60.0f; // adaptive noise estimate (dB FS)
         float alpha         = 0.05f;  // noise EMA speed
 
@@ -356,21 +354,69 @@ struct VoiceIO {
 
     // ---------- TTS ----------
     bool tts_init() {
-        // Force eSpeak NG to ALSA backend so it doesn’t fight with PortAudio/ALSA rate limits
-        setenv("ESPEAKNG_AUDIO_OUTPUT", "alsa", 1);     // valid in espeak-ng
-        setenv("ESPEAKNG_PLAYBACK_DEVICE", "default", 1);
+        // Whether to pause capture while speaking (default on)
+        tts_pause_mic = env_get_int("VOICE_TTS_PAUSE", 1) != 0;
 
+        // If espeak ALSA backend isn't available, optionally fallback via aplay
+        tts_use_aplay_fallback = env_get_int("VOICE_TTS_APLAY_FALLBACK", 1) != 0;
+
+        // Force ALSA backend + route to our PCM
+        setenv("ESPEAKNG_AUDIO_OUTPUT", "alsa", 1);
+        setenv("ESPEAKNG_PLAYBACK_DEVICE", "default", 1);
+        
         int sr = espeak_Initialize(AUDIO_OUTPUT_PLAYBACK, 0, nullptr, 0);
-        if (sr <= 0) return false;
+        if (sr <= 0) {
+            if (tts_use_aplay_fallback) {
+                LOG_WRN("[voice] espeak ALSA playback init failed; will use aplay fallback\n");
+                return true; // we will pipe to aplay in tts_say()
+            }
+            return false;
+        }
 
         espeak_SetVoiceByName(tts_voice.c_str());
         espeak_SetParameter(espeakRATE, tts_rate_wpm, 0);
+        
         return true;
     }
+
+    // small helper to shell-quote (you already have sh_quote() above; reuse it)
+    static std::string q(const std::string& s) { return sh_quote(s); }
+
     void tts_say(const std::string& text) {
         if (!tts_enabled || text.empty()) return;
-        espeak_Synth(text.c_str(), text.size() + 1, 0, POS_CHARACTER, 0, espeakCHARS_AUTO, nullptr, nullptr);
-        espeak_Synchronize();
+
+        bool stopped = false;
+
+        if (tts_pause_mic) {
+            std::lock_guard<std::mutex> lk(pa_mu);
+            if (pa_in && Pa_IsStreamActive(pa_in) == 1) {
+                Pa_StopStream(pa_in);
+                stopped = true;
+            }
+        }
+
+        if (tts_use_aplay_fallback) {
+            // No ALSA backend in espeak-ng? Pipe to aplay on the target device.
+            // Note: we avoid any shell injection by quoting the user text.
+            const std::string cmd =
+                "espeak -v " + q(tts_voice) + " -s " + std::to_string(tts_rate_wpm) +
+                " --stdout " + q(text) + " | aplay -q -D default";
+            int rc = std::system(cmd.c_str());
+            if (rc != 0) {
+                LOG_ERR("[voice] tts fallback via aplay failed rc=%d\n", rc);
+            }
+        } else {
+            // Normal library playback path
+            espeak_Synth(text.c_str(), text.size() + 1, 0, POS_CHARACTER, 0, espeakCHARS_AUTO, nullptr, nullptr);
+            espeak_Synchronize();
+        }
+
+        if (stopped) {
+            std::lock_guard<std::mutex> lk(pa_mu);
+            if (pa_in && Pa_IsStreamStopped(pa_in) == 1) {
+                Pa_StartStream(pa_in);
+            }
+        }
     }
 
     // ---------- capture thread ----------
@@ -393,10 +439,9 @@ struct VoiceIO {
             return;
         }
 
-        const bool need_resample = approx_ne(hw_rate, (double)srate);
+        const bool need_resample = hw_rate != srate;
         if (need_resample) {
-            int inr = (int)(hw_rate + (hw_rate >= 0 ? 0.5 : -0.5));
-            resampler.reset(inr, srate);
+            resampler.reset(hw_rate, srate);
         }
         vad.reset(srate);
 
@@ -499,10 +544,10 @@ struct VoiceIO {
         if (!tts_v.empty()) tts_voice = tts_v;
 
         vad_enabled       = env_get_int  ("VOICE_VAD", 1) != 0;
-        vad.margin_db     = env_get_float("VOICE_VAD_MARGIN_DB", 10.0f);
-        vad.start_frames  = env_get_int  ("VOICE_VAD_START_FRAMES", 3);
-        vad.hang_frames   = env_get_int  ("VOICE_VAD_HANG_FRAMES", 12);
-        vad.pre_ms        = env_get_int  ("VOICE_VAD_PRE_MS", 200);
+        vad.margin_db     = env_get_float("VOICE_VAD_MARGIN_DB", 12.0f);
+        vad.start_frames  = env_get_int  ("VOICE_VAD_START_FRAMES", 6);
+        vad.hang_frames   = env_get_int  ("VOICE_VAD_HANG_FRAMES", 40);
+        vad.pre_ms        = env_get_int  ("VOICE_VAD_PRE_MS", 300);
 
         std::string model_path = env_or("VOSK_MODEL", VOSK_DEFAULT_MODEL_PATH);
         if (model_path.empty()) model_path = env_or("VOSK_MODEL_DIR", "");
@@ -527,13 +572,11 @@ struct VoiceIO {
         tts_enabled = env_get_int("VOICE_TTS", 1) != 0;
 
         if (tts_enabled) {
-            // try to force ALSA if your espeak-ng build supports it
-            setenv("ESPEAKNG_AUDIO_OUTPUT", "alsa", 1);
-            setenv("ESPEAKNG_PLAYBACK_DEVICE", "default", 1);
-
             if (!tts_init()) {
                 LOG_ERR("[voice] eSpeak NG init failed; disabling TTS\n");
                 tts_enabled = false;
+            } else {
+                LOG_INF("[voice] TTS ready on device: %s\n", tts_device.c_str());
             }
         }
 
