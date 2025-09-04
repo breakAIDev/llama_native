@@ -573,7 +573,7 @@ struct VoiceIO {
                 LOG_ERR("[voice] eSpeak NG init failed; disabling TTS\n");
                 tts_enabled = false;
             } else {
-                LOG_INF("[voice] TTS ready on device: %s\n", tts_device.c_str());
+                LOG_INF("[voice] TTS ready on device: default\n");
             }
         }
 
