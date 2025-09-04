@@ -67,7 +67,8 @@ struct VoiceIO {
     int         framesPer    = 512;     // PortAudio frames per buffer
     std::string tts_voice    = "en-us";
     int         tts_rate_wpm = 170;
-
+    bool tts_enabled = true;
+    
     // ---------- runtime ----------
     std::atomic<bool> running{false};
     std::thread       th;
@@ -210,29 +211,44 @@ struct VoiceIO {
                     di ? di->maxOutputChannels : 0, (di && di->name) ? di->name : "?");
         }
     }
+
+    static std::string norm(std::string s) {
+        std::string o; o.reserve(s.size());
+        for (unsigned char c : s) if (std::isalnum(c)) o.push_back((char)std::tolower(c));
+        return o;
+    }
+
     static int pick_input_device_from_env() {
         std::string want = env_or("VOICE_IN_DEV", "");
         const int n = Pa_GetDeviceCount();
-        if (want.empty()) {
-            for (int i = 0; i < n; ++i) {
-                const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
-                if (di && di->maxInputChannels > 0) return i;
-            }
-            return paNoDevice;
+
+        // remember first input-capable device as a guaranteed fallback
+        int first_in = paNoDevice;
+        for (int i = 0; i < n; ++i) {
+            const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
+            if (di && di->maxInputChannels > 0) { first_in = i; break; }
         }
+
+        if (want.empty()) return first_in;
+
+        // numeric index?
         char* end = nullptr; long idx = std::strtol(want.c_str(), &end, 10);
         if (end != want.c_str() && idx >= 0 && idx < n) {
             const PaDeviceInfo* di = Pa_GetDeviceInfo((int)idx);
             if (di && di->maxInputChannels > 0) return (int)idx;
         }
-        std::string wlc = to_lower(want);
+
+        // fuzzy substring: ignore case and non-alnum (so "SNIPER71" matches "SNIPER7.1")
+        std::string w = norm(want);
         for (int i = 0; i < n; ++i) {
             const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
             if (!di || di->maxInputChannels <= 0) continue;
             std::string name = di->name ? di->name : "";
-            if (to_lower(name).find(wlc) != std::string::npos) return i;
+            if (norm(name).find(w) != std::string::npos) return i;
         }
-        return paNoDevice;
+
+        // fallback so we never return "no device"
+        return first_in;
     }
 
     bool open_input_stream_choose_rate(int devIndex, double& openedRate) {
@@ -371,9 +387,18 @@ struct VoiceIO {
             LOG_ERR("[voice] PortAudio init failed\n");
             return false;
         }
-        if (!tts_init()) {
-            LOG_ERR("[voice] eSpeak NG init failed (check ESPEAKNG backend)\n");
-            // not fatal for STT; keep going
+
+        tts_enabled = env_get_int("VOICE_TTS", 1) != 0;
+
+        if (tts_enabled) {
+            // try to force ALSA if your espeak-ng build supports it
+            setenv("ESPEAKNG_AUDIO_OUTPUT", "alsa", 1);
+            setenv("ESPEAKNG_PLAYBACK_DEVICE", "default", 1);
+
+            if (!tts_init()) {
+                LOG_ERR("[voice] eSpeak NG init failed; disabling TTS\n");
+                tts_enabled = false;
+            }
         }
 
         running = true;
