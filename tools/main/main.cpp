@@ -64,7 +64,7 @@
 
 struct VoiceIO {
     // ---------- config (overridable via env) ----------
-    int         srate        = 44100;   // recognizer target rate
+    int         srate        = 48000;   // recognizer target rate
     int         channels     = 1;       // input channels (Vosk likes mono)
     int         framesPer    = 1024;     // PortAudio frames per buffer
     std::string tts_voice    = "en-us";
@@ -225,7 +225,7 @@ struct VoiceIO {
     }
 
     static int pick_input_device_from_env() {
-        std::string want = env_or("VOICE_IN_DEV", "");
+        std::string want = env_or("VOICE_IN_DEV", "SNIPER");
         const int n = Pa_GetDeviceCount();
 
         int first_in = paNoDevice;
