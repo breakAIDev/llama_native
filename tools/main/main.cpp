@@ -231,7 +231,7 @@ struct VoiceIO {
         return o;
     }
 
-    static int pick_input_device_from_env() {
+    int pick_input_device_from_env() {
         const int n = Pa_GetDeviceCount();
 
         int first_in = paNoDevice;
