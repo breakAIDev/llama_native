@@ -64,27 +64,34 @@
 
 struct VoiceIO {
     // ---------- config (overridable via env) ----------
-    int         srate        = 48000;   // recognizer target rate
-    int         channels     = 1;       // input channels (Vosk likes mono)
-    int         framesPer    = 1024;     // PortAudio frames per buffer
-    std::string tts_voice    = "en-us";
-    int         tts_rate_wpm = 170;
-    bool        tts_enabled  = true;
+    bool        tts_enabled;
+    bool        tts_pause_mic;  // Whether to pause capture while speaking (default on)
+    bool        tts_use_aplay_fallback; // If espeak ALSA backend isn't available, optionally fallback via aplay
+
+    std::string tts_voice; // language
+    std::string tts_gender; // male or female
+    int         tts_pitch;
+    int         tts_wpm; // words per minutes
+    int         tts_amplitude;
+
+    int         srate;   // recognizer target rate
+    int         channels;       // input channels (Vosk likes mono)
+    int         framesPer;     // PortAudio frames per buffer
+    
+    std::string stt_input_device; // voice input device
 
     // ---------- runtime ----------
     std::atomic<bool> running{false};
     std::thread       th;
-    PaStream*         pa_in   = nullptr;
-    int               hw_rate = 0;
+    PaStream*         pa_in         = nullptr;
+    int               hw_rate       = 0;
 
-    VoskModel*        vmodel = nullptr;
-    VoskRecognizer*   vrec   = nullptr;
+    VoskModel*        vmodel        = nullptr;
+    VoskRecognizer*   vrec          = nullptr;
 
     std::queue<std::string> q;
     std::mutex              mu;
     std::condition_variable cv;
-    bool            tts_pause_mic = true;    // pause capture while speaking (override by env)
-    bool            tts_use_aplay_fallback = false; // optional fallback
 
     // ---------- tiny helpers ----------
     static inline int16_t s16_round_clamp(float x) {
@@ -225,7 +232,6 @@ struct VoiceIO {
     }
 
     static int pick_input_device_from_env() {
-        std::string want = env_or("VOICE_IN_DEV", "SNIPER");
         const int n = Pa_GetDeviceCount();
 
         int first_in = paNoDevice;
@@ -234,17 +240,15 @@ struct VoiceIO {
             if (di && di->maxInputChannels > 0) { first_in = i; break; }
         }
 
-        if (want.empty()) return first_in;
-
         // numeric index?
-        char* end = nullptr; long idx = std::strtol(want.c_str(), &end, 10);
-        if (end != want.c_str() && idx >= 0 && idx < n) {
+        char* end = nullptr; long idx = std::strtol(stt_input_device.c_str(), &end, 10);
+        if (end != stt_input_device.c_str() && idx >= 0 && idx < n) {
             const PaDeviceInfo* di = Pa_GetDeviceInfo((int)idx);
             if (di && di->maxInputChannels > 0) return (int)idx;
         }
 
         // fuzzy substring
-        std::string w = norm(want);
+        std::string w = norm(stt_input_device);
         for (int i = 0; i < n; ++i) {
             const PaDeviceInfo* di = Pa_GetDeviceInfo(i);
             if (!di || di->maxInputChannels <= 0) continue;
@@ -267,8 +271,7 @@ struct VoiceIO {
 
         // Try requested rate first, then safe fallbacks
         std::vector<int> rates;
-        const int want = env_get_int("VOICE_RATE", srate);
-        rates.push_back(want);
+        rates.push_back(srate);
         if (di->defaultSampleRate > 0) rates.push_back((int)di->defaultSampleRate);
         for (int r : {48000, 44100, 32000, 24000, 16000}) {
             if (std::find(rates.begin(), rates.end(), r) == rates.end()) rates.push_back(r);
@@ -354,12 +357,6 @@ struct VoiceIO {
 
     // ---------- TTS ----------
     bool tts_init() {
-        // Whether to pause capture while speaking (default on)
-        tts_pause_mic = env_get_int("VOICE_TTS_PAUSE", 1) != 0;
-
-        // If espeak ALSA backend isn't available, optionally fallback via aplay
-        tts_use_aplay_fallback = env_get_int("VOICE_TTS_APLAY_FALLBACK", 1) != 0;
-
         // Force ALSA backend + route to our PCM
         setenv("ESPEAKNG_AUDIO_OUTPUT", "alsa", 1);
         setenv("ESPEAKNG_PLAYBACK_DEVICE", "default", 1);
@@ -374,7 +371,7 @@ struct VoiceIO {
         }
 
         espeak_SetVoiceByName(tts_voice.c_str());
-        espeak_SetParameter(espeakRATE, tts_rate_wpm, 0);
+        espeak_SetParameter(espeakRATE, tts_wpm, 0);
         
         return true;
     }
@@ -396,8 +393,12 @@ struct VoiceIO {
             // No ALSA backend in espeak-ng? Pipe to aplay on the target device.
             // Note: we avoid any shell injection by quoting the user text.
             const std::string cmd =
-                "espeak -v " + sh_quote(tts_voice) + " -s " + std::to_string(tts_rate_wpm) +
-                " --stdout " + sh_quote(text) + " | aplay -q -D default";
+                "espeak -v " + sh_quote(tts_voice + "+" + tts_gender) +
+                " -p " + std::to_string(tts_pitch) +
+                " -s " + std::to_string(tts_wpm) +
+                " -a " + std::to_string(tts_amplitude) +
+                " --stdout " + sh_quote(text) +
+                " | aplay -q -D default";
             int rc = std::system(cmd.c_str());
             if (rc != 0) {
                 LOG_ERR("[voice] tts fallback via aplay failed rc=%d\n", rc);
@@ -533,19 +534,28 @@ struct VoiceIO {
 
     // ---------- lifecycle ----------
     bool init() {
-        srate     = env_get_int("VOICE_RATE",     srate);
-        channels  = env_get_int("VOICE_CHANNELS", channels);
-        framesPer = env_get_int("VOICE_FRAMES",   framesPer);
+        tts_enabled = env_get_int("ESPEAK", 1) != 0;
+        tts_pause_mic = env_get_int("ESPEAK_PAUSE", 1) != 0;
+        tts_use_aplay_fallback = env_get_int("ESPEAK_APLAY_FALLBACK", 1) != 0;
 
-        std::string tts_v = env_or("ESPEAK_VOICE", "");
-        if (!tts_v.empty()) tts_voice = tts_v;
+        tts_voice = env_or("ESPEAK_VOICE", "en-us");
+        tts_gender = env_or("ESPEAK_GENDER", "m1");
+        tts_pitch = env_get_int("ESPEAK_PITCH", 58);
+        tts_wpm = env_get_int("ESPEAK_WPM", 170);
+        tts_amplitude = env_get_int("ESPEAK_AMPLITUDE", 175);
 
+        srate     = env_get_int("VOICE_RATE",     48000);
+        channels  = env_get_int("VOICE_CHANNELS", 1);
+        framesPer = env_get_int("VOICE_FRAMES",   1024);
+
+        stt_input_device = env_or("VOICE_IN_DEV", "SNIPER");
+        
         vad_enabled       = env_get_int  ("VOICE_VAD", 1) != 0;
         vad.margin_db     = env_get_float("VOICE_VAD_MARGIN_DB", 12.0f);
         vad.start_frames  = env_get_int  ("VOICE_VAD_START_FRAMES", 6);
         vad.hang_frames   = env_get_int  ("VOICE_VAD_HANG_FRAMES", 40);
         vad.pre_ms        = env_get_int  ("VOICE_VAD_PRE_MS", 300);
-
+        
         std::string model_path = env_or("VOSK_MODEL", VOSK_DEFAULT_MODEL_PATH);
         if (model_path.empty()) model_path = env_or("VOSK_MODEL_DIR", "");
         if (model_path.empty()) model_path = env_or("VOSK_MODEL_ZIP", "");
@@ -565,8 +575,6 @@ struct VoiceIO {
             LOG_ERR("[voice] PortAudio init failed\n");
             return false;
         }
-
-        tts_enabled = env_get_int("VOICE_TTS", 1) != 0;
 
         if (tts_enabled) {
             if (!tts_init()) {
