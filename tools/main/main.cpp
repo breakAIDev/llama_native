@@ -48,7 +48,7 @@
 
 #include <portaudio.h>
 #include <vosk_api.h>
-#include <espeak/speak_lib.h>
+#include <espeak-ng/speak_lib.h>
 
 #ifndef VOSK_DEFAULT_MODEL_DIR
 #define VOSK_DEFAULT_MODEL_DIR "/etc/models/vosk-model-small-en-us-0.15.zip"
@@ -393,7 +393,7 @@ struct VoiceIO {
             // No ALSA backend in espeak-ng? Pipe to aplay on the target device.
             // Note: we avoid any shell injection by quoting the user text.
             const std::string cmd =
-                "espeak -v " + sh_quote(tts_voice + "+" + tts_gender) +
+                "espeak-ng -v " + sh_quote(tts_voice + "+" + tts_gender) +
                 " -p " + std::to_string(tts_pitch) +
                 " -s " + std::to_string(tts_wpm) +
                 " -a " + std::to_string(tts_amplitude) +
