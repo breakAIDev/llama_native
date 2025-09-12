@@ -732,8 +732,8 @@ struct ExtInbox {
         addr.sun_family = AF_UNIX;
         std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", out_path.c_str());
         if (::connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-            ::write(fd, json_line.c_str(), json_line.size())
-            ::write(fd, "\n", 1)
+            (void)::write(fd, json_line.c_str(), json_line.size());
+            (void)::write(fd, "\n", 1);
         }
         ::close(fd);
     }
