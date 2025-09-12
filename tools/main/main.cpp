@@ -96,7 +96,8 @@ static inline std::string json_escape(const std::string& in) {
 static thread_local std::string g_ble_current_id;
 
 #ifndef VOSK_DEFAULT_MODEL_DIR
-#define VOSK_DEFAULT_MODEL_DIR "/etc/models/vosk-model-small-en-us-0.15.zip"
+#define VOSK_DEFAULT_MODEL_DIR "/etc/models/vosk-model-en-us-0.22-lgraph.zip"
+// #define VOSK_DEFAULT_MODEL_DIR "/etc/models/vosk-model-small-en-us-0.15.zip"
 #endif
 
 #ifndef VOSK_DEFAULT_MODEL_PATH
