@@ -12,6 +12,7 @@
 #include <sys/un.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
 #include <pthread.h>
 #include <deque>
 #include <atomic>
@@ -57,6 +58,42 @@
 #include <portaudio.h>
 #include <vosk_api.h>
 #include <espeak-ng/speak_lib.h>
+// ---- RAIZE: small helpers for JSON + time + current id ----
+static inline std::string now_iso_utc() {
+    std::time_t t = std::time(nullptr);
+    char buf[32];
+    std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+    return std::string(buf);
+}
+// returns a JSON string literal for 'in' (including the surrounding quotes)
+static inline std::string json_escape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 2);
+    out.push_back('\"');
+    for (unsigned char c : in) {
+        switch (c) {
+            case '\"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char u[7];
+                    std::snprintf(u, sizeof(u), "\\u%04x", (unsigned)c);
+                    out += u;
+                } else {
+                    out.push_back((char)c);
+                }
+        }
+    }
+    out.push_back('\"');
+    return out;
+}
+// Single global to carry BLE message id across the turn
+static thread_local std::string g_ble_current_id;
 
 #ifndef VOSK_DEFAULT_MODEL_DIR
 #define VOSK_DEFAULT_MODEL_DIR "/etc/models/vosk-model-small-en-us-0.15.zip"
@@ -618,7 +655,6 @@ struct VoiceIO {
 };
 
 static VoiceIO g_voice;
-#endif // HAVE_VOICE_IO
 
 // ===== RAIZE Unix-socket bridge for external app text =====
 struct ExtInbox {
@@ -696,12 +732,14 @@ struct ExtInbox {
         addr.sun_family = AF_UNIX;
         std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", out_path.c_str());
         if (::connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-            ::write(fd, json_line.c_str(), json_line.size());
-            ::write(fd, "\n", 1);
+            (void)::write(fd, json_line.c_str(), json_line.size())
+            (void)::write(fd, "\n", 1)
         }
         ::close(fd);
     }
 } g_ext;
+
+#endif // HAVE_VOICE_IO
 
 // ----------------------- Globals from original CLI ----------------------
 static llama_context           ** g_ctx;
@@ -1104,10 +1142,13 @@ int main(int argc, char ** argv) {
     if (params.interactive) {
         LOG_INF("%s: interactive mode on.\n", __func__);
 
+    // Init voice I/O (optional)
+#ifdef HAVE_VOICE_IO
         // Start RAIZE external inbox
         g_ext.start();
         // Tell BLE bridge we're alive
-        g_ext.send_event(std::string("{\"type\":\"status\",\"up\":true,\"ts\":\"") + common_get_system_info_time() + "\"}");
+        g_ext.send_event(std::string("{\"type\":\"status\",\"up\":true,\"ts\":\"") + now_iso_utc() + "\"}");
+#endif
 
         if (!params.antiprompt.empty()) {
             for (const auto & antiprompt : params.antiprompt) {
@@ -1503,18 +1544,18 @@ int main(int argc, char ** argv) {
                         std::string content = assistant_ss.str();
 #ifdef HAVE_VOICE_IO
                         g_voice.tts_say(content);
-#endif
                         // Pull id if set in this scope (best-effort); else empty
-                        static thread_local std::string current_id;
+                        /* using global g_ble_current_id */
                         std::ostringstream ev;
                         // Use UTC time
                         std::time_t t = std::time(nullptr);
                         char buf[32]; std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
-                        ev << "{\"type\":\"final\",\"id\":\"" << current_id
+                        ev << "{\"type\":\"final\",\"id\":\"" << g_ble_current_id
                            << "\",\"content\":" << json_escape(content)
                            << ",\"ts\":\"" << buf << "\"}";
                         g_ext.send_event(ev.str());
-                        current_id.clear();
+                        g_ble_current_id.clear();
+#endif
                     }
                     is_interacting = true;
                     LOG("\n");
@@ -1557,11 +1598,11 @@ int main(int argc, char ** argv) {
                     if (g_ext.pop(ext_id, ext_text)) {
                         buffer = ext_text;
                         // Store current id in a static so we can mirror it back on final
-                        static thread_local std::string current_id;
-                        current_id = ext_id;
+                        /* using global g_ble_current_id */
+                        g_ble_current_id = ext_id;
                         // Inform BLE we accepted the request
-                        if (!current_id.empty()) {
-                            g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+current_id+"\"}");
+                        if (!g_ble_current_id.empty()) {
+                            g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+g_ble_current_id+"\"}");
                         }
                     } else {
                         std::string voice;
@@ -1690,15 +1731,15 @@ int main(int argc, char ** argv) {
             g_voice.tts_say(assistant_ss.str());
             // Emit partial/final as needed (here treat as final chunk for simplicity)
             std::string content = assistant_ss.str();
-            static thread_local std::string current_id;
+            /* using global g_ble_current_id */
             std::time_t t = std::time(nullptr);
             char buf[32]; std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
             std::ostringstream ev;
-            ev << "{\"type\":\"final\",\"id\":\"" << current_id
+            ev << "{\"type\":\"final\",\"id\":\"" << g_ble_current_id
                << "\",\"content\":" << json_escape(content)
                << ",\"ts\":\"" << buf << "\"}";
             g_ext.send_event(ev.str());
-            current_id.clear();
+            g_ble_current_id.clear();
 #endif
         }
     }
