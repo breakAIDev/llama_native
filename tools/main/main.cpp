@@ -6,6 +6,18 @@
 #include "llama.h"
 #include "chat.h"
 
+// ==== RAIZE bridge additions ====
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <pthread.h>
+#include <deque>
+#include <atomic>
+#include <mutex>
+#include <condition_variable>
+
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -15,7 +27,6 @@
 #include <string>
 #include <vector>
 #include <thread>
-#include <atomic>
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__))
 #include <signal.h>
@@ -36,14 +47,11 @@
 // ========================= Voice I/O (optional) =========================
 #ifdef HAVE_VOICE_IO
 #include <queue>
-#include <mutex>
-#include <condition_variable>
 #include <cstdlib>
 #include <cstdint>
 #include <algorithm>
 #include <filesystem>
 #include <chrono>
-#include <deque>
 #include <cmath>
 
 #include <portaudio.h>
@@ -598,16 +606,102 @@ struct VoiceIO {
         Pa_Terminate();
     }
 
-    std::string wait_utt() {
+    // New: non-blocking pop with timeout for dual-source input
+    bool try_wait_utt_for(std::string& out, int timeout_ms) {
         std::unique_lock<std::mutex> lk(mu);
-        cv.wait(lk, [&]{ return !q.empty(); });
-        std::string s = std::move(q.front()); q.pop();
-        return s;
+        if (cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&]{ return !q.empty(); })) {
+            out = std::move(q.front()); q.pop();
+            return true;
+        }
+        return false;
     }
 };
 
 static VoiceIO g_voice;
 #endif // HAVE_VOICE_IO
+
+// ===== RAIZE Unix-socket bridge for external app text =====
+struct ExtInbox {
+    std::string in_path  = "/run/raize_llm_in.sock";   // Python -> C++
+    std::string out_path = "/run/raize_llm_out.sock";  // C++ -> Python
+    int         in_srv_fd = -1;
+    std::thread in_th;
+    std::mutex  mu;
+    std::deque<std::pair<std::string,std::string>> q; // (id,text)
+
+    std::mutex  out_mu;
+
+    static int make_server(const std::string& path) {
+        ::unlink(path.c_str());
+        int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) return -1;
+        struct sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", path.c_str());
+        if (::bind(fd, (struct sockaddr*)&addr, sizeof(addr)) != 0) { ::close(fd); return -1; }
+        ::chmod(path.c_str(), 0666);
+        if (::listen(fd, 4) != 0) { ::close(fd); return -1; }
+        return fd;
+    }
+
+    void start() {
+        in_srv_fd = make_server(in_path);
+        in_th = std::thread([&]{ this->accept_loop(); });
+    }
+
+    void stop() {
+        if (in_srv_fd >= 0) ::close(in_srv_fd);
+        if (in_th.joinable()) in_th.join();
+    }
+
+    void accept_loop() {
+        while (true) {
+            int cfd = ::accept(in_srv_fd, nullptr, nullptr);
+            if (cfd < 0) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
+            std::string buf;
+            char tmp[1024];
+            while (true) {
+                ssize_t n = ::read(cfd, tmp, sizeof(tmp));
+                if (n <= 0) break;
+                buf.append(tmp, tmp+n);
+                size_t p;
+                while ((p = buf.find('\n')) != std::string::npos) {
+                    std::string line = buf.substr(0, p);
+                    buf.erase(0, p+1);
+                    // Expect minimal JSON: {"id":"...", "text":"..."}
+                    auto id = VoiceIO::jget(line, "id");
+                    auto tx = VoiceIO::jget(line, "text");
+                    if (!tx.empty()) {
+                        std::lock_guard<std::mutex> lk(mu);
+                        q.emplace_back(id, tx);
+                    }
+                }
+            }
+            ::close(cfd);
+        }
+    }
+
+    bool pop(std::string& id, std::string& text) {
+        std::lock_guard<std::mutex> lk(mu);
+        if (q.empty()) return false;
+        id = q.front().first; text = q.front().second; q.pop_front();
+        return true;
+    }
+
+    void send_event(const std::string& json_line) {
+        // connect out_path and send a line
+        int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+        if (fd < 0) return;
+        struct sockaddr_un addr{};
+        addr.sun_family = AF_UNIX;
+        std::snprintf(addr.sun_path, sizeof(addr.sun_path), "%s", out_path.c_str());
+        if (::connect(fd, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
+            ::write(fd, json_line.c_str(), json_line.size());
+            ::write(fd, "\n", 1);
+        }
+        ::close(fd);
+    }
+} g_ext;
 
 // ----------------------- Globals from original CLI ----------------------
 static llama_context           ** g_ctx;
@@ -1010,6 +1104,11 @@ int main(int argc, char ** argv) {
     if (params.interactive) {
         LOG_INF("%s: interactive mode on.\n", __func__);
 
+        // Start RAIZE external inbox
+        g_ext.start();
+        // Tell BLE bridge we're alive
+        g_ext.send_event(std::string("{\"type\":\"status\",\"up\":true,\"ts\":\"") + common_get_system_info_time() + "\"}");
+
         if (!params.antiprompt.empty()) {
             for (const auto & antiprompt : params.antiprompt) {
                 LOG_INF("Reverse prompt: '%s'\n", antiprompt.c_str());
@@ -1400,9 +1499,22 @@ int main(int argc, char ** argv) {
 
                     if (params.enable_chat_template) {
                         chat_add_and_format("assistant", assistant_ss.str());
+                        // Send final event
+                        std::string content = assistant_ss.str();
 #ifdef HAVE_VOICE_IO
-                        g_voice.tts_say(assistant_ss.str());
+                        g_voice.tts_say(content);
 #endif
+                        // Pull id if set in this scope (best-effort); else empty
+                        static thread_local std::string current_id;
+                        std::ostringstream ev;
+                        // Use UTC time
+                        std::time_t t = std::time(nullptr);
+                        char buf[32]; std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+                        ev << "{\"type\":\"final\",\"id\":\"" << current_id
+                           << "\",\"content\":" << json_escape(content)
+                           << ",\"ts\":\"" << buf << "\"}";
+                        g_ext.send_event(ev.str());
+                        current_id.clear();
                     }
                     is_interacting = true;
                     LOG("\n");
@@ -1427,6 +1539,11 @@ int main(int argc, char ** argv) {
                     LOG("\n> ");
                 }
 
+                // When a full assistant message is spoken, emit a JSON event for BLE
+                // Hooking two places:
+                // 1) When EOG is detected and assistant_ss is set (below)
+                // 2) When token budget is hit (interactive loop continuation)
+
                 if (params.input_prefix_bos) {
                     LOG_DBG("adding input prefix BOS token\n");
                     embd_inp.push_back(llama_vocab_bos(vocab));
@@ -1434,10 +1551,30 @@ int main(int argc, char ** argv) {
 
                 std::string buffer;
 #ifdef HAVE_VOICE_IO
-                // block until we get a final utterance from Vosk (after VAD end)
-                buffer = g_voice.wait_utt();
-                buffer += "/no_think\n";
-                LOG_INF("%s", buffer.c_str());
+                // Prefer external inbox; if none arrives within 50ms, poll voice with timeout.
+                {
+                    std::string ext_id, ext_text;
+                    if (g_ext.pop(ext_id, ext_text)) {
+                        buffer = ext_text;
+                        // Store current id in a static so we can mirror it back on final
+                        static thread_local std::string current_id;
+                        current_id = ext_id;
+                        // Inform BLE we accepted the request
+                        if (!current_id.empty()) {
+                            g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+current_id+"\"}");
+                        }
+                    } else {
+                        std::string voice;
+                        if (g_voice.try_wait_utt_for(voice, 50)) {
+                            buffer = voice;
+                        }
+                    }
+                }
+                if (!buffer.empty()) {
+                    buffer += "/no_think\n";
+                    LOG_INF("%s", buffer.c_str());
+                    // Ack to BLE if it had an id (since id is only known in g_ext.pop(), we can't retrieve it here; optional)
+                }
 #else
                 if (!params.input_prefix.empty() && !params.conversation_mode) {
                     LOG_DBG("appending input prefix: '%s'\n", params.input_prefix.c_str());
@@ -1551,6 +1688,17 @@ int main(int argc, char ** argv) {
 #ifdef HAVE_VOICE_IO
             // speak what we have so far in this turn
             g_voice.tts_say(assistant_ss.str());
+            // Emit partial/final as needed (here treat as final chunk for simplicity)
+            std::string content = assistant_ss.str();
+            static thread_local std::string current_id;
+            std::time_t t = std::time(nullptr);
+            char buf[32]; std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+            std::ostringstream ev;
+            ev << "{\"type\":\"final\",\"id\":\"" << current_id
+               << "\",\"content\":" << json_escape(content)
+               << ",\"ts\":\"" << buf << "\"}";
+            g_ext.send_event(ev.str());
+            current_id.clear();
 #endif
         }
     }

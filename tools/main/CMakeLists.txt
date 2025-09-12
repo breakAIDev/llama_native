@@ -14,7 +14,7 @@ find_package(PkgConfig REQUIRED)
 # llama.cpp exports targets "llama" and "common" in the same build.
 # If building separately, add: find_package(llama CONFIG REQUIRED)
 
-set(TARGET llama-cli)
+set(TARGET raize)
 add_executable(${TARGET} main.cpp)
 
 target_link_libraries(${TARGET} PRIVATE
