@@ -104,7 +104,7 @@ static thread_local std::string g_ble_current_id;
   #ifdef VOSK_DEFAULT_MODEL_DIR
     #define VOSK_DEFAULT_MODEL_PATH VOSK_DEFAULT_MODEL_DIR
   #else
-    #define VOSK_DEFAULT_MODEL_PATH "/usr/share/vosk/models/en/model"
+    #define VOSK_DEFAULT_MODEL_PATH "/etc/models/"
   #endif
 #endif
 
