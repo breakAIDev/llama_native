@@ -58,6 +58,7 @@
 #include <portaudio.h>
 #include <vosk_api.h>
 #include <espeak-ng/speak_lib.h>
+
 // ---- RAIZE: small helpers for JSON + time + current id ----
 static inline std::string now_iso_utc() {
     std::time_t t = std::time(nullptr);
@@ -65,6 +66,7 @@ static inline std::string now_iso_utc() {
     std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
     return std::string(buf);
 }
+
 // returns a JSON string literal for 'in' (including the surrounding quotes)
 static inline std::string json_escape(const std::string& in) {
     std::string out;
@@ -92,6 +94,7 @@ static inline std::string json_escape(const std::string& in) {
     out.push_back('\"');
     return out;
 }
+
 // Single global to carry BLE message id across the turn
 static thread_local std::string g_ble_current_id;
 
@@ -186,32 +189,38 @@ struct VoiceIO {
         const char* v = std::getenv(name);
         return (v && *v) ? std::string(v) : std::string(fallback ? fallback : "");
     }
+
     static int env_get_int(const char* name, int defv) {
         const char* v = std::getenv(name);
         if (!v || !*v) return defv;
         char* end = nullptr; long x = std::strtol(v, &end, 10);
         return (end == v) ? defv : (int)x;
     }
+
     static float env_get_float(const char* name, float defv) {
         const char* v = std::getenv(name);
         if (!v || !*v) return defv;
         char* end = nullptr; float x = std::strtof(v, &end);
         return (end == v) ? defv : x;
     }
+
     static bool ends_with(const std::string& s, const char* suf) {
         size_t n = s.size(), m = std::char_traits<char>::length(suf);
         return n >= m && s.compare(n - m, m, suf) == 0;
     }
+
     static std::string sh_quote(const std::string& p) {
         std::string out = "'"; for (char c : p) out += (c=='\'') ? "'\"'\"'" : std::string(1,c);
         out += "'"; return out;
     }
+
     static bool dir_nonempty(const std::filesystem::path& d) {
         namespace fs = std::filesystem;
         if (!fs::exists(d) || !fs::is_directory(d)) return false;
         for (auto it = fs::directory_iterator(d); it != fs::directory_iterator(); ++it) return true;
         return false;
     }
+
     static std::string jget(const std::string& s, const char* key) {
         const std::string k = std::string("\"") + key + "\"";
         size_t p = s.find(k); if (p == std::string::npos) return "";
@@ -246,6 +255,7 @@ struct VoiceIO {
         }
         return outDir.string();
     }
+
     static std::string ensure_model_dir(const std::string& path) {
         namespace fs = std::filesystem;
         if (path.empty()) return {};
@@ -260,6 +270,7 @@ struct VoiceIO {
         for (char& c : s) c = (char)std::tolower((unsigned char)c);
         return s;
     }
+
     static void log_pa_devices() {
         const int n = Pa_GetDeviceCount();
         for (int i = 0; i < n; ++i) {
@@ -371,6 +382,7 @@ struct VoiceIO {
             int keep = preroll_nsamp();
             while ((int)preroll.size() > keep) preroll.pop_front();
         }
+        
         void drain_preroll(std::vector<int16_t>& out) {
             out.reserve(out.size() + preroll.size());
             while (!preroll.empty()) { out.push_back(preroll.front()); preroll.pop_front(); }
@@ -1143,13 +1155,12 @@ int main(int argc, char ** argv) {
     if (params.interactive) {
         LOG_INF("%s: interactive mode on.\n", __func__);
 
-    // Init voice I/O (optional)
-#ifdef HAVE_VOICE_IO
-        // Start RAIZE external inbox
-        g_ext.start();
-        // Tell BLE bridge we're alive
-        g_ext.send_event(std::string("{\"type\":\"status\",\"up\":true,\"ts\":\"") + now_iso_utc() + "\"}");
-#endif
+// #ifdef HAVE_VOICE_IO
+//         // Start RAIZE external inbox
+//         g_ext.start();
+//         // Tell BLE bridge we're alive
+//         g_ext.send_event(std::string("{\"type\":\"status\",\"up\":true,\"ts\":\"") + now_iso_utc() + "\"}");
+// #endif
 
         if (!params.antiprompt.empty()) {
             for (const auto & antiprompt : params.antiprompt) {
@@ -1545,17 +1556,17 @@ int main(int argc, char ** argv) {
                         std::string content = assistant_ss.str();
 #ifdef HAVE_VOICE_IO
                         g_voice.tts_say(content);
-                        // Pull id if set in this scope (best-effort); else empty
-                        /* using global g_ble_current_id */
-                        std::ostringstream ev;
-                        // Use UTC time
-                        std::time_t t = std::time(nullptr);
-                        char buf[32]; std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
-                        ev << "{\"type\":\"final\",\"id\":\"" << g_ble_current_id
-                           << "\",\"content\":" << json_escape(content)
-                           << ",\"ts\":\"" << buf << "\"}";
-                        g_ext.send_event(ev.str());
-                        g_ble_current_id.clear();
+                        // // Pull id if set in this scope (best-effort); else empty
+                        // /* using global g_ble_current_id */
+                        // std::ostringstream ev;
+                        // // Use UTC time
+                        // std::time_t t = std::time(nullptr);
+                        // char buf[32]; std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+                        // ev << "{\"type\":\"final\",\"id\":\"" << g_ble_current_id
+                        //    << "\",\"content\":" << json_escape(content)
+                        //    << ",\"ts\":\"" << buf << "\"}";
+                        // g_ext.send_event(ev.str());
+                        // g_ble_current_id.clear();
 #endif
                     }
                     is_interacting = true;
@@ -1595,22 +1606,22 @@ int main(int argc, char ** argv) {
 #ifdef HAVE_VOICE_IO
                 // Prefer external inbox; if none arrives within 50ms, poll voice with timeout.
                 {
-                    std::string ext_id, ext_text;
-                    if (g_ext.pop(ext_id, ext_text)) {
-                        buffer = ext_text;
-                        // Store current id in a static so we can mirror it back on final
-                        /* using global g_ble_current_id */
-                        g_ble_current_id = ext_id;
-                        // Inform BLE we accepted the request
-                        if (!g_ble_current_id.empty()) {
-                            g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+g_ble_current_id+"\"}");
-                        }
-                    } else {
+                    // std::string ext_id, ext_text;
+                    // if (g_ext.pop(ext_id, ext_text)) {
+                    //     buffer = ext_text;
+                    //     // Store current id in a static so we can mirror it back on final
+                    //     /* using global g_ble_current_id */
+                    //     g_ble_current_id = ext_id;
+                    //     // Inform BLE we accepted the request
+                    //     if (!g_ble_current_id.empty()) {
+                    //         g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+g_ble_current_id+"\"}");
+                    //     }
+                    // } else {
                         std::string voice;
                         if (g_voice.try_wait_utt_for(voice, 50)) {
                             buffer = voice;
                         }
-                    }
+                    // }
                 }
                 if (!buffer.empty()) {
                     buffer += "/no_think\n";
@@ -1730,17 +1741,17 @@ int main(int argc, char ** argv) {
 #ifdef HAVE_VOICE_IO
             // speak what we have so far in this turn
             g_voice.tts_say(assistant_ss.str());
-            // Emit partial/final as needed (here treat as final chunk for simplicity)
-            std::string content = assistant_ss.str();
-            /* using global g_ble_current_id */
-            std::time_t t = std::time(nullptr);
-            char buf[32]; std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
-            std::ostringstream ev;
-            ev << "{\"type\":\"final\",\"id\":\"" << g_ble_current_id
-               << "\",\"content\":" << json_escape(content)
-               << ",\"ts\":\"" << buf << "\"}";
-            g_ext.send_event(ev.str());
-            g_ble_current_id.clear();
+            // // Emit partial/final as needed (here treat as final chunk for simplicity)
+            // std::string content = assistant_ss.str();
+            // /* using global g_ble_current_id */
+            // std::time_t t = std::time(nullptr);
+            // char buf[32]; std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+            // std::ostringstream ev;
+            // ev << "{\"type\":\"final\",\"id\":\"" << g_ble_current_id
+            //    << "\",\"content\":" << json_escape(content)
+            //    << ",\"ts\":\"" << buf << "\"}";
+            // g_ext.send_event(ev.str());
+            // g_ble_current_id.clear();
 #endif
         }
     }
