@@ -96,9 +96,6 @@ static inline std::string json_escape(const std::string& in) {
     return out;
 }
 
-std::function<void(const std::string&)> on_final;
-void set_on_final(std::function<void(const std::string&)> cb) { on_final = std::move(cb); }
-
 // Single global to carry BLE message id across the turn
 static thread_local std::string g_ble_current_id;
 
@@ -145,6 +142,9 @@ struct VoiceIO {
     std::queue<std::string> q;
     std::mutex              mu;
     std::condition_variable cv;
+
+    std::function<void(const std::string&)> on_final;
+    void set_on_final(std::function<void(const std::string&)> cb) { on_final = std::move(cb); }
 
     // ---------- tiny helpers ----------
     static inline int16_t s16_round_clamp(float x) {
