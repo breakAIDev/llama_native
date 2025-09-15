@@ -54,6 +54,7 @@
 #include <filesystem>
 #include <chrono>
 #include <cmath>
+#include <functional>
 
 #include <portaudio.h>
 #include <vosk_api.h>
@@ -94,6 +95,9 @@ static inline std::string json_escape(const std::string& in) {
     out.push_back('\"');
     return out;
 }
+
+std::function<void(const std::string&)> on_final;
+void set_on_final(std::function<void(const std::string&)> cb) { on_final = std::move(cb); }
 
 // Single global to carry BLE message id across the turn
 static thread_local std::string g_ble_current_id;
@@ -564,6 +568,7 @@ struct VoiceIO {
                     if (!txt.empty()) {
                         { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
                         cv.notify_one();
+                        if (on_final) on_final(txt);
                     }
                 } else {
                     // Fallback: try normal result if final is empty
@@ -573,6 +578,7 @@ struct VoiceIO {
                         if (!txt.empty()) {
                             { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
                             cv.notify_one();
+                            if (on_final) on_final(txt);
                         }
                     }
                 }
@@ -1145,10 +1151,18 @@ int main(int argc, char ** argv) {
 	
     // Init voice I/O (optional)
 #ifdef HAVE_VOICE_IO
+    std::mutex voice_cb_mu;
+    std::deque<std::string> voice_ready;
+
     if (!g_voice.init()) {
         LOG_ERR("[voice] init failed; continuing with keyboard input\n");
     } else {
         g_voice.tts_say("Hello, I'm ready. Please speak.");
+        
+        g_voice.set_on_final([&](const std::string& txt){
+            std::lock_guard<std::mutex> lk(voice_cb_mu);
+            voice_ready.push_back(txt);
+        });
     }
 #endif
 
@@ -1617,14 +1631,23 @@ int main(int argc, char ** argv) {
                     //         g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+g_ble_current_id+"\"}");
                     //     }
                     // } else {
-                        std::string voice;
-                        if (g_voice.try_wait_utt_for(voice, 50)) {
-                            buffer = voice;
+                        // 1) Instant grab if a final utterance was just delivered
+                        {
+                            std::lock_guard<std::mutex> lk(voice_cb_mu);
+                            if (!voice_ready.empty()) {
+                                buffer = std::move(voice_ready.front());
+                                voice_ready.pop_front();
+                            }
+                        }
+                        if (buffer.empty()) {
+                            std::string voice;
+                            if (g_voice.try_wait_utt_for(voice, 50)) {
+                                buffer = std::move(voice);
+                            }
                         }
                     // }
                 }
                 if (!buffer.empty()) {
-                    buffer += "/no_think\n";
                     LOG_INF("%s", buffer.c_str());
                     // Ack to BLE if it had an id (since id is only known in g_ext.pop(), we can't retrieve it here; optional)
                 }
@@ -1660,8 +1683,11 @@ int main(int argc, char ** argv) {
 #endif
                 if (buffer.empty()) { // Enter key on empty line lets the user pass control back
                     LOG_DBG("empty line, passing control back\n");
-                } else { // Add tokens to embd only if the input buffer is non-empty
+                } else {
+                    // Add tokens to embd only if the input buffer is non-empty
                     // append input suffix if any
+                    buffer += "/no_think\n";
+
                     if (!params.input_suffix.empty() && !params.conversation_mode) {
                         LOG_DBG("appending input suffix: '%s'\n", params.input_suffix.c_str());
                         LOG("%s", params.input_suffix.c_str());
