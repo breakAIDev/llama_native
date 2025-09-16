@@ -103,6 +103,29 @@ if (WITH_VOICE_IO)
       endif()
     endif()
   endif()
+  
+  # If present, we use its higher-quality resampler and define HAVE_SPEEXDSP.
+  # Yocto/Ubuntu pkg name: speexdsp (dev: libspeexdsp-dev)
+  pkg_check_modules(SPEEXDSP QUIET speexdsp)
+  if (SPEEXDSP_FOUND)
+    message(STATUS "Using SpeexDSP resampler")
+    target_compile_definitions(${TARGET} PRIVATE HAVE_SPEEXDSP)
+    target_include_directories(${TARGET} PRIVATE ${SPEEXDSP_INCLUDE_DIRS})
+    target_link_libraries(${TARGET} PRIVATE ${SPEEXDSP_LIBRARIES})
+  else()
+    # Fallback to manual find if pkg-config is missing
+    find_library(SPEEXDSP_LIBRARY NAMES speexdsp
+      HINTS ${CMAKE_INSTALL_PREFIX}/lib ${CMAKE_INSTALL_PREFIX}/lib64
+      PATHS /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64
+    )
+    if (SPEEXDSP_LIBRARY)
+      message(STATUS "Using SpeexDSP (found library only): ${SPEEXDSP_LIBRARY}")
+      target_compile_definitions(${TARGET} PRIVATE HAVE_SPEEXDSP)
+      target_link_libraries(${TARGET} PRIVATE ${SPEEXDSP_LIBRARY})
+    else()
+      message(STATUS "SpeexDSP not found; will use built-in linear resampler")
+    endif()
+  endif()
 endif()
 
 install(TARGETS ${TARGET} RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})

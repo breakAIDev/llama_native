@@ -60,6 +60,11 @@
 #include <vosk_api.h>
 #include <espeak-ng/speak_lib.h>
 
+// Optional: higher-quality resampler (enable with -DHAVE_SPEEXDSP and link -lspeexdsp)
+#ifdef HAVE_SPEEXDSP
+  #include <speex/speex_resampler.h>
+#endif
+
 // ---- RAIZE: small helpers for JSON + time + current id ----
 static inline std::string now_iso_utc() {
     std::time_t t = std::time(nullptr);
@@ -99,42 +104,35 @@ static inline std::string json_escape(const std::string& in) {
 // Single global to carry BLE message id across the turn
 static thread_local std::string g_ble_current_id;
 
-#ifndef VOSK_DEFAULT_MODEL_DIR
-#define VOSK_DEFAULT_MODEL_DIR "/etc/models/vosk-model-en-us-0.22-lgraph.zip"
-// #define VOSK_DEFAULT_MODEL_DIR "/etc/models/vosk-model-small-en-us-0.15.zip"
-#endif
-
 #ifndef VOSK_DEFAULT_MODEL_PATH
-  #ifdef VOSK_DEFAULT_MODEL_DIR
-    #define VOSK_DEFAULT_MODEL_PATH VOSK_DEFAULT_MODEL_DIR
-  #else
-    #define VOSK_DEFAULT_MODEL_PATH "/etc/models/"
-  #endif
+    #define VOSK_DEFAULT_MODEL_PATH "/etc/models/vosk-model-en-us-0.22-lgraph.zip"
+    // #define VOSK_DEFAULT_MODEL_PATH "/etc/models/vosk-model-small-en-us-0.15.zip"
 #endif
 
 struct VoiceIO {
     // ---------- config (overridable via env) ----------
     bool        tts_enabled;
-    bool        tts_pause_mic;  // Whether to pause capture while speaking (default on)
+    bool        tts_pause_mic;          // Whether to pause capture while speaking (default on)
     bool        tts_use_aplay_fallback; // If espeak ALSA backend isn't available, optionally fallback via aplay
 
-    std::string tts_voice; // language
-    std::string tts_gender; // male or female
+    std::string tts_voice;              // language
+    std::string tts_gender;             // male or female
     int         tts_pitch;
-    int         tts_wpm; // words per minutes
+    int         tts_wpm;                // words per minutes
     int         tts_amplitude;
 
-    int         srate;   // recognizer target rate
-    int         channels;       // input channels (Vosk likes mono)
-    int         framesPer;     // PortAudio frames per buffer
+    // IMPORTANT: recognizer/VAD rate (keep 16k) – device may run at 48k
+    int         srate;                  // VAD+Vosk target rate (typically 16000)
+    int         channels;               // input channels (Vosk likes mono)
+    int         framesPer;              // PortAudio frames per buffer
     
-    std::string stt_input_device; // voice input device
+    std::string stt_input_device;       // voice input device
 
     // ---------- runtime ----------
     std::atomic<bool> running{false};
     std::thread       th;
     PaStream*         pa_in         = nullptr;
-    int               hw_rate       = 0;
+    int               hw_rate       = 0;// actual device rate (e.g., 48000)
 
     VoskModel*        vmodel        = nullptr;
     VoskRecognizer*   vrec          = nullptr;
@@ -154,39 +152,44 @@ struct VoiceIO {
         return (int16_t)x;
     }
 
+#ifdef HAVE_SPEEXDSP
     struct Resampler {
-        int     in_rate  = 0;
-        int     out_rate = 0;
-        double  pos      = 0.0;
-        int16_t last     = 0;
-
+        SpeexResamplerState* st = nullptr;
         void reset(int inr, int outr) {
-            in_rate  = inr; out_rate = outr;
-            pos = 0.0; last = 0;
+            if (st) speex_resampler_destroy(st);
+            int err = 0; st = speex_resampler_init(1, inr, outr, 5, &err);
         }
+        void process(const int16_t* in, size_t n_in, std::vector<int16_t>& out) {
+            if (!st || n_in == 0) return;
+            // Generous worst-case expansion; we will shrink back
+            size_t start = out.size();
+            out.resize(start + (n_in * 2) + 8);
+            spx_uint32_t ilen = (spx_uint32_t)n_in, olen = (spx_uint32_t)(out.size() - start);
+            speex_resampler_process_int(st, 0, in, &ilen, out.data() + start, &olen);
+            out.resize(start + olen);
+        }
+        ~Resampler(){ if (st) speex_resampler_destroy(st); }
+    } resampler;
+#else
+    struct Resampler {
+        int     in_rate  = 0, out_rate = 0; double pos = 0.0; int16_t last = 0;
+        void reset(int inr, int outr) { in_rate = inr; out_rate = outr; pos = 0.0; last = 0; }
         void process(const int16_t* in, size_t n_in, std::vector<int16_t>& out) {
             if (n_in == 0) return;
             if (in_rate <= 0 || out_rate <= 0 || in_rate == out_rate) {
-                out.insert(out.end(), in, in + n_in);
-                last = in[n_in - 1];
-                return;
+                out.insert(out.end(), in, in + n_in); last = in[n_in - 1]; return;
             }
-            const double step = (double)in_rate / (double)out_rate;
-            double p = pos;
+            const double step = (double)in_rate / (double)out_rate; double p = pos;
             while (true) {
-                size_t idx1 = (size_t)p;
-                if (idx1 >= n_in) break;
-                const double a  = p - (double)idx1;
-                const int16_t s1 = in[idx1];
-                const int16_t s0 = (idx1 == 0) ? last : in[idx1 - 1];
-                const float sample = (float)((1.0 - a)*(double)s0 + a*(double)s1);
-                out.push_back(VoiceIO::s16_round_clamp(sample));
-                p += step;
+                size_t i1 = (size_t)p; if (i1 >= n_in) break;
+                double a = p - (double)i1; int16_t s1 = in[i1]; int16_t s0 = (i1==0? last : in[i1-1]);
+                float sample = (float)((1.0 - a)*(double)s0 + a*(double)s1);
+                out.push_back(VoiceIO::s16_round_clamp(sample)); p += step;
             }
-            last = in[n_in - 1];
-            pos  = p - (double)n_in;
+            last = in[n_in - 1]; pos = p - (double)n_in;
         }
     } resampler;
+#endif
 
     // ---------- misc helpers ----------
     static std::string env_or(const char* name, const char* fallback) {
@@ -270,9 +273,13 @@ struct VoiceIO {
     }
 
     // ---------- PortAudio device ----------
-    static std::string to_lower(std::string s) {
-        for (char& c : s) c = (char)std::tolower((unsigned char)c);
-        return s;
+    static std::string norm(std::string s) {
+        std::string o;
+        o.reserve(s.size());
+        for (unsigned char c : s)
+            if (std::isalnum(c))
+                o.push_back((char)std::tolower(c));
+        return o;
     }
 
     static void log_pa_devices() {
@@ -284,12 +291,6 @@ struct VoiceIO {
                     i, ai ? ai->name : "?", di ? di->maxInputChannels : 0,
                     di ? di->maxOutputChannels : 0, (di && di->name) ? di->name : "?");
         }
-    }
-
-    static std::string norm(std::string s) {
-        std::string o; o.reserve(s.size());
-        for (unsigned char c : s) if (std::isalnum(c)) o.push_back((char)std::tolower(c));
-        return o;
     }
 
     int pick_input_device_from_env() {
@@ -332,7 +333,8 @@ struct VoiceIO {
 
         // Try requested rate first, then safe fallbacks
         std::vector<int> rates;
-        rates.push_back(srate);
+        int want_hw = env_get_int("VOICE_HW_RATE", 0);
+        if (want_hw > 0) rates.push_back(want_hw);
         if (di->defaultSampleRate > 0) rates.push_back((int)di->defaultSampleRate);
         for (int r : {48000, 44100, 32000, 24000, 16000}) {
             if (std::find(rates.begin(), rates.end(), r) == rates.end()) rates.push_back(r);
@@ -351,11 +353,11 @@ struct VoiceIO {
     struct VAD {
         int   sr            = 16000;  // sample rate of the audio we feed to Vosk
         int   pre_ms        = 300;    // pre-roll to keep before speech start
-        float margin_db     = 12.0f;  // how many dB above noise floor counts as speech
-        int   start_frames  = 6;      // consecutive “speech” frames to trigger start
-        int   hang_frames   = 40;     // consecutive “silence” frames to trigger end
+        float margin_db     = 8.0f;   // how many dB above noise floor counts as speech
+        int   start_frames  = 4;      // consecutive “speech” frames to trigger start
+        int   hang_frames   = 25;     // consecutive “silence” frames to trigger end
         float noise_db      = -60.0f; // adaptive noise estimate (dB FS)
-        float alpha         = 0.05f;  // noise EMA speed
+        float alpha         = 0.02f;  // noise EMA speed
 
         std::deque<int16_t> preroll;  // ring buffer of pre-roll audio
         bool speaking = false;
@@ -498,7 +500,11 @@ struct VoiceIO {
             Pa_CloseStream(pa_in); pa_in = nullptr;
             return;
         }
-
+        
+        const PaDeviceInfo* di = Pa_GetDeviceInfo(dev);
+        LOG_INF("[voice] opened input '%s' @ %d Hz ; recognizer=%d Hz ; framesPer=%d\n",
+                di && di->name ? di->name : "?", hw_rate, srate, framesPer);
+        
         const bool need_resample = hw_rate != srate;
         if (need_resample) {
             resampler.reset(hw_rate, srate);
@@ -605,20 +611,21 @@ struct VoiceIO {
         tts_voice = env_or("ESPEAK_VOICE", "en-us");
         tts_gender = env_or("ESPEAK_GENDER", "m1");
         tts_pitch = env_get_int("ESPEAK_PITCH", 58);
-        tts_wpm = env_get_int("ESPEAK_WPM", 170);
+        tts_wpm = env_get_int("ESPEAK_WPM", 140);
         tts_amplitude = env_get_int("ESPEAK_AMPLITUDE", 175);
 
-        srate     = env_get_int("VOICE_RATE",     48000);
+        srate     = env_get_int("VOICE_RATE",     16000);
         channels  = env_get_int("VOICE_CHANNELS", 1);
         framesPer = env_get_int("VOICE_FRAMES",   1024);
 
         stt_input_device = env_or("VOICE_IN_DEV", "SNIPER");
         
         vad_enabled       = env_get_int  ("VOICE_VAD", 1) != 0;
-        vad.margin_db     = env_get_float("VOICE_VAD_MARGIN_DB", 12.0f);
-        vad.start_frames  = env_get_int  ("VOICE_VAD_START_FRAMES", 6);
-        vad.hang_frames   = env_get_int  ("VOICE_VAD_HANG_FRAMES", 40);
+        vad.margin_db     = env_get_float("VOICE_VAD_MARGIN_DB", 8.0f);
+        vad.start_frames  = env_get_int  ("VOICE_VAD_START_FRAMES", 4);
+        vad.hang_frames   = env_get_int  ("VOICE_VAD_HANG_FRAMES", 25);
         vad.pre_ms        = env_get_int  ("VOICE_VAD_PRE_MS", 300);
+        vad.alpha         = env_get_int  ("VOICE_VAD_ALPHA", 0.02f);
         
         std::string model_path = env_or("VOSK_MODEL", VOSK_DEFAULT_MODEL_PATH);
         if (model_path.empty()) model_path = env_or("VOSK_MODEL_DIR", "");
@@ -634,6 +641,9 @@ struct VoiceIO {
         if (!vmodel) { LOG_ERR("[voice] cannot load vosk model at %s\n", model_dir.c_str()); return false; }
         vrec = vosk_recognizer_new(vmodel, (float)srate);
         if (!vrec)  { LOG_ERR("[voice] cannot create recognizer\n"); return false; }
+
+        // helpful for debugging word timings (optional)
+        vosk_recognizer_set_words(vrec, 1);
 
         if (Pa_Initialize() != paNoError) {
             LOG_ERR("[voice] PortAudio init failed\n");
