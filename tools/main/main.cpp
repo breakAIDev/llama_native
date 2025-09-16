@@ -1589,6 +1589,41 @@ int main(int argc, char ** argv) {
                 }
 
                 std::string buffer;
+#ifdef HAVE_VOICE_IO
+                // Prefer external inbox; if none arrives within 50ms, poll voice with timeout.
+                {
+                    // std::string ext_id, ext_text;
+                    // if (g_ext.pop(ext_id, ext_text)) {
+                    //     buffer = ext_text;
+                    //     // Store current id in a static so we can mirror it back on final
+                    //     /* using global g_ble_current_id */
+                    //     g_ble_current_id = ext_id;
+                    //     // Inform BLE we accepted the request
+                    //     if (!g_ble_current_id.empty()) {
+                    //         g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+g_ble_current_id+"\"}");
+                    //     }
+                    // } else {
+                        // 1) Instant grab if a final utterance was just delivered
+                        {
+                            std::lock_guard<std::mutex> lk(voice_cb_mu);
+                            if (!voice_ready.empty()) {
+                                buffer = std::move(voice_ready.front());
+                                voice_ready.pop_front();
+                            }
+                        }
+                        if (buffer.empty()) {
+                            std::string voice;
+                            if (g_voice.try_wait_utt_for(voice, 50)) {
+                                buffer = std::move(voice);
+                            }
+                        }
+                    // }
+                }
+                if (!buffer.empty()) {
+                    LOG_INF("%s", buffer.c_str());
+                    // Ack to BLE if it had an id (since id is only known in g_ext.pop(), we can't retrieve it here; optional)
+                }
+#else
                 if (!params.input_prefix.empty() && !params.conversation_mode) {
                     LOG_DBG("appending input prefix: '%s'\n", params.input_prefix.c_str());
                     LOG("%s", params.input_prefix.c_str());
@@ -1615,13 +1650,9 @@ int main(int argc, char ** argv) {
                 }
 
                 if (buffer.back() == '\n') {
-                    // Implement #587:
-                    // If the user wants the text to end in a newline,
-                    // this should be accomplished by explicitly adding a newline by using \ followed by return,
-                    // then returning control by pressing return again.
                     buffer.pop_back();
                 }
-
+#endif
                 if (buffer.empty()) { // Enter key on empty line lets the user pass control back
                     LOG_DBG("empty line, passing control back\n");
                 } else {
@@ -1717,6 +1748,10 @@ int main(int argc, char ** argv) {
     common_perf_print(ctx, smpl);
 
     common_sampler_free(smpl);
+
+#ifdef HAVE_VOICE_IO
+    g_voice.shutdown();
+#endif
 
     llama_backend_free();
 
