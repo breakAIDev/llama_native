@@ -352,8 +352,8 @@ struct VoiceIO {
         int   sr            = 16000;  // sample rate of the audio we feed to Vosk
         int   pre_ms        = 300;    // pre-roll to keep before speech start
         float margin_db     = 12.0f;  // how many dB above noise floor counts as speech
-        int   start_frames  = 6;      // consecutive “speech” frames to trigger start
-        int   hang_frames   = 40;     // consecutive “silence” frames to trigger end
+        int   start_frames  = 6;      // consecutive ï¿½speechï¿½ frames to trigger start
+        int   hang_frames   = 40;     // consecutive ï¿½silenceï¿½ frames to trigger end
         float noise_db      = -60.0f; // adaptive noise estimate (dB FS)
         float alpha         = 0.05f;  // noise EMA speed
 
@@ -396,7 +396,7 @@ struct VoiceIO {
         bool update(const int16_t* p, int n) {
             const float db = level_db(p, n);
 
-            // Update noise estimate when not clearly “far above” threshold
+            // Update noise estimate when not clearly ï¿½far aboveï¿½ threshold
             if (!speaking || db < noise_db + margin_db * 0.5f) {
                 noise_db = (1.0f - alpha) * noise_db + alpha * db;
                 if (noise_db > -20.0f) noise_db = -20.0f; // clamp upper bound
@@ -516,7 +516,7 @@ struct VoiceIO {
             if (err == paInputOverflowed) { Pa_Sleep(1);  continue; }
             if (err != paNoError)         { Pa_Sleep(10); continue; }
 
-            // Choose the buffer we’ll analyze/forward (16 kHz mono expected by Vosk)
+            // Choose the buffer weï¿½ll analyze/forward (16 kHz mono expected by Vosk)
             const int16_t* data = nullptr;
             int            ns   = 0;
 
@@ -550,7 +550,7 @@ struct VoiceIO {
             bool speaking_now = vad.update(data, ns);
 
             if (!was_speaking && speaking_now) {
-                // Start-of-speech: feed preroll first so we don’t clip initial words
+                // Start-of-speech: feed preroll first so we donï¿½t clip initial words
                 tmp.clear();
                 vad.drain_preroll(tmp);
                 if (!tmp.empty()) {
@@ -1559,6 +1559,22 @@ int main(int argc, char ** argv) {
 
                     if (params.enable_chat_template) {
                         chat_add_and_format("assistant", assistant_ss.str());
+                        // Send final event
+                        std::string content = assistant_ss.str();
+#ifdef HAVE_VOICE_IO
+                        g_voice.tts_say(content);
+                        // // Pull id if set in this scope (best-effort); else empty
+                        // /* using global g_ble_current_id */
+                        // std::ostringstream ev;
+                        // // Use UTC time
+                        // std::time_t t = std::time(nullptr);
+                        // char buf[32]; std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+                        // ev << "{\"type\":\"final\",\"id\":\"" << g_ble_current_id
+                        //    << "\",\"content\":" << json_escape(content)
+                        //    << ",\"ts\":\"" << buf << "\"}";
+                        // g_ext.send_event(ev.str());
+                        // g_ble_current_id.clear();
+#endif
                     }
                     is_interacting = true;
                     LOG("\n");
@@ -1589,41 +1605,41 @@ int main(int argc, char ** argv) {
                 }
 
                 std::string buffer;
-#ifdef HAVE_VOICE_IO
-                // Prefer external inbox; if none arrives within 50ms, poll voice with timeout.
-                {
-                    // std::string ext_id, ext_text;
-                    // if (g_ext.pop(ext_id, ext_text)) {
-                    //     buffer = ext_text;
-                    //     // Store current id in a static so we can mirror it back on final
-                    //     /* using global g_ble_current_id */
-                    //     g_ble_current_id = ext_id;
-                    //     // Inform BLE we accepted the request
-                    //     if (!g_ble_current_id.empty()) {
-                    //         g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+g_ble_current_id+"\"}");
-                    //     }
-                    // } else {
-                        // 1) Instant grab if a final utterance was just delivered
-                        {
-                            std::lock_guard<std::mutex> lk(voice_cb_mu);
-                            if (!voice_ready.empty()) {
-                                buffer = std::move(voice_ready.front());
-                                voice_ready.pop_front();
-                            }
-                        }
-                        if (buffer.empty()) {
-                            std::string voice;
-                            if (g_voice.try_wait_utt_for(voice, 50)) {
-                                buffer = std::move(voice);
-                            }
-                        }
-                    // }
-                }
-                if (!buffer.empty()) {
-                    LOG_INF("%s", buffer.c_str());
-                    // Ack to BLE if it had an id (since id is only known in g_ext.pop(), we can't retrieve it here; optional)
-                }
-#else
+// #ifdef HAVE_VOICE_IO
+//                 // Prefer external inbox; if none arrives within 50ms, poll voice with timeout.
+//                 {
+//                     // std::string ext_id, ext_text;
+//                     // if (g_ext.pop(ext_id, ext_text)) {
+//                     //     buffer = ext_text;
+//                     //     // Store current id in a static so we can mirror it back on final
+//                     //     /* using global g_ble_current_id */
+//                     //     g_ble_current_id = ext_id;
+//                     //     // Inform BLE we accepted the request
+//                     //     if (!g_ble_current_id.empty()) {
+//                     //         g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+g_ble_current_id+"\"}");
+//                     //     }
+//                     // } else {
+//                         // 1) Instant grab if a final utterance was just delivered
+//                         {
+//                             std::lock_guard<std::mutex> lk(voice_cb_mu);
+//                             if (!voice_ready.empty()) {
+//                                 buffer = std::move(voice_ready.front());
+//                                 voice_ready.pop_front();
+//                             }
+//                         }
+//                         if (buffer.empty()) {
+//                             std::string voice;
+//                             if (g_voice.try_wait_utt_for(voice, 50)) {
+//                                 buffer = std::move(voice);
+//                             }
+//                         }
+//                     // }
+//                 }
+//                 if (!buffer.empty()) {
+//                     LOG_INF("%s", buffer.c_str());
+//                     // Ack to BLE if it had an id (since id is only known in g_ext.pop(), we can't retrieve it here; optional)
+//                 }
+// #else
                 if (!params.input_prefix.empty() && !params.conversation_mode) {
                     LOG_DBG("appending input prefix: '%s'\n", params.input_prefix.c_str());
                     LOG("%s", params.input_prefix.c_str());
@@ -1652,7 +1668,7 @@ int main(int argc, char ** argv) {
                 if (buffer.back() == '\n') {
                     buffer.pop_back();
                 }
-#endif
+// #endif
                 if (buffer.empty()) { // Enter key on empty line lets the user pass control back
                     LOG_DBG("empty line, passing control back\n");
                 } else {
@@ -1736,6 +1752,21 @@ int main(int argc, char ** argv) {
         if (params.interactive && n_remain <= 0 && params.n_predict >= 0) {
             n_remain = params.n_predict;
             is_interacting = true;
+#ifdef HAVE_VOICE_IO
+            // speak what we have so far in this turn
+            g_voice.tts_say(assistant_ss.str());
+            // // Emit partial/final as needed (here treat as final chunk for simplicity)
+            // std::string content = assistant_ss.str();
+            // /* using global g_ble_current_id */
+            // std::time_t t = std::time(nullptr);
+            // char buf[32]; std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+            // std::ostringstream ev;
+            // ev << "{\"type\":\"final\",\"id\":\"" << g_ble_current_id
+            //    << "\",\"content\":" << json_escape(content)
+            //    << ",\"ts\":\"" << buf << "\"}";
+            // g_ext.send_event(ev.str());
+            // g_ble_current_id.clear();
+#endif
         }
     }
 
