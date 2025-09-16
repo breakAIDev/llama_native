@@ -1148,6 +1148,23 @@ int main(int argc, char ** argv) {
         SetConsoleCtrlHandler(reinterpret_cast<PHANDLER_ROUTINE>(console_ctrl_handler), true);
 #endif
     }
+	
+    // Init voice I/O (optional)
+#ifdef HAVE_VOICE_IO
+    std::mutex voice_cb_mu;
+    std::deque<std::string> voice_ready;
+
+    if (!g_voice.init()) {
+        LOG_ERR("[voice] init failed; continuing with keyboard input\n");
+    } else {
+        g_voice.tts_say("Hello, I'm ready. Please speak.");
+        
+        g_voice.set_on_final([&](const std::string& txt){
+            std::lock_guard<std::mutex> lk(voice_cb_mu);
+            voice_ready.push_back(txt);
+        });
+    }
+#endif
 
     if (params.interactive) {
         LOG_INF("%s: interactive mode on.\n", __func__);
