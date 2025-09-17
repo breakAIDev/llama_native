@@ -663,7 +663,7 @@ struct VoiceIO {
         }
 
         running = true;
-        th = std::thread(&thread_fn, this);
+        th = std::thread(&VoiceIO::thread_fn, this);
         return true;
     }
 
