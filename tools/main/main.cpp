@@ -105,8 +105,8 @@ static inline std::string json_escape(const std::string& in) {
 static thread_local std::string g_ble_current_id;
 
 #ifndef VOSK_DEFAULT_MODEL_PATH
-    #define VOSK_DEFAULT_MODEL_PATH "/etc/models/vosk-model-en-us-0.22-lgraph.zip"
-    // #define VOSK_DEFAULT_MODEL_PATH "/etc/models/vosk-model-small-en-us-0.15.zip"
+    // #define VOSK_DEFAULT_MODEL_PATH "/etc/models/vosk-model-en-us-0.22-lgraph.zip"
+    #define VOSK_DEFAULT_MODEL_PATH "/etc/models/vosk-model-small-en-us-0.15.zip"
 #endif
 
 struct VoiceIO {
@@ -161,6 +161,8 @@ struct VoiceIO {
         }
         void process(const int16_t* in, size_t n_in, std::vector<int16_t>& out) {
             if (!st || n_in == 0) return;
+            LOG_INF("HAVE_SPEEXDSP");
+            
             // Generous worst-case expansion; we will shrink back
             size_t start = out.size();
             out.resize(start + (n_in * 2) + 8);
@@ -176,6 +178,7 @@ struct VoiceIO {
         void reset(int inr, int outr) { in_rate = inr; out_rate = outr; pos = 0.0; last = 0; }
         void process(const int16_t* in, size_t n_in, std::vector<int16_t>& out) {
             if (n_in == 0) return;
+            LOG_INF("Resampler");
             if (in_rate <= 0 || out_rate <= 0 || in_rate == out_rate) {
                 out.insert(out.end(), in, in + n_in); last = in[n_in - 1]; return;
             }
@@ -519,8 +522,8 @@ struct VoiceIO {
 
         while (running) {
             PaError err = Pa_ReadStream(pa_in, inbuf.data(), (unsigned long)inbuf.size());
-            if (err == paInputOverflowed) { Pa_Sleep(1);  continue; }
-            if (err != paNoError)         { Pa_Sleep(10); continue; }
+            if (err == paInputOverflowed) { LOG_INF("[voice] overflow"); Pa_Sleep(1);  continue; }
+            if (err != paNoError)         { LOG_INF("[voice] PaError"); Pa_Sleep(10); continue; }
 
             // Choose the buffer we’ll analyze/forward (16 kHz mono expected by Vosk)
             const int16_t* data = nullptr;
@@ -660,7 +663,7 @@ struct VoiceIO {
         }
 
         running = true;
-        th = std::thread(&VoiceIO::thread_fn, this);
+        th = std::thread(&thread_fn, this);
         return true;
     }
 
