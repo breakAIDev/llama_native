@@ -345,7 +345,7 @@ struct VoiceIO {
 
         // Do NOT pre-validate with Pa_IsFormatSupported; open directly (plug/asym often fail validation)
         for (int r : rates) {
-            PaError err = Pa_OpenStream(&pa_in, &in, nullptr, (double)r, (unsigned long)framesPer, paClipOff, nullptr, nullptr);
+            PaError err = Pa_OpenStream(&pa_in, &in, nullptr, (double)r, (unsigned long)framesPer, paNoFlag, nullptr, nullptr);
             if (err == paNoError) { openedRate = r; return true; }
             LOG_ERR("[voice] Pa_OpenStream(in) @%d Hz failed: %s\n", r, Pa_GetErrorText(err));
         }
@@ -522,8 +522,8 @@ struct VoiceIO {
 
         while (running) {
             PaError err = Pa_ReadStream(pa_in, inbuf.data(), (unsigned long)inbuf.size());
-            if (err == paInputOverflowed) { LOG_INF("[voice] overflow"); Pa_Sleep(1);  continue; }
-            if (err != paNoError)         { LOG_INF("[voice] PaError"); Pa_Sleep(10); continue; }
+            if (err == paInputOverflowed) { LOG_INF("[voice] overflow"); }
+            else if (err != paNoError)         { LOG_INF("[voice] PaError"); Pa_Sleep(10); continue; }
 
             // Choose the buffer we’ll analyze/forward (16 kHz mono expected by Vosk)
             const int16_t* data = nullptr;
