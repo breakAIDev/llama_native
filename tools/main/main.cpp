@@ -334,7 +334,7 @@ struct VoiceIO {
         in.sampleFormat = paInt16;
 
         // Latency: allow override in ms, else fall back to 2x high input latency
-        double lat_ms = env_get_double("PA_IN_LATENCY_MS", -1.0);
+        double lat_ms = env_get_float("PA_IN_LATENCY_MS", -1.0);
         if (lat_ms > 0) {
             in.suggestedLatency = lat_ms / 1000.0;
         } else {
