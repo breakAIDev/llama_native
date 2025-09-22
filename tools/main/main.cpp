@@ -332,11 +332,18 @@ struct VoiceIO {
         in.device = devIndex;
         in.channelCount = channels;
         in.sampleFormat = paInt16;
-        in.suggestedLatency = di->defaultLowInputLatency;
+
+        // Latency: allow override in ms, else fall back to 2x high input latency
+        double lat_ms = env_get_double("PA_IN_LATENCY_MS", -1.0);
+        if (lat_ms > 0) {
+            in.suggestedLatency = lat_ms / 1000.0;
+        } else {
+            in.suggestedLatency = std::max(di->defaultHighInputLatency, di->defaultLowInputLatency) * 2.0;
+        }
 
         // Try requested rate first, then safe fallbacks
         std::vector<int> rates;
-        int want_hw = env_get_int("VOICE_HW_RATE", 0);
+        int want_hw = env_get_int("VOICE_HW_RATE", 48000);
         if (want_hw > 0) rates.push_back(want_hw);
         if (di->defaultSampleRate > 0) rates.push_back((int)di->defaultSampleRate);
         for (int r : {48000, 44100, 32000, 24000, 16000}) {
@@ -521,9 +528,12 @@ struct VoiceIO {
         bool was_speaking = false;
 
         while (running) {
-            PaError err = Pa_ReadStream(pa_in, inbuf.data(), (unsigned long)inbuf.size());
-            if (err == paInputOverflowed) { LOG_INF("[voice] overflow"); }
-            else if (err != paNoError)         { LOG_INF("[voice] PaError"); Pa_Sleep(10); continue; }
+            PaError err;
+            do {
+                err = Pa_ReadStream(pa_in, inbuf.data(), (unsigned long)inbuf.size());
+            } while (err == paInputOverflowed);
+            
+            if (err != paNoError) { LOG_INF("[voice] PaError"); Pa_Sleep(2); continue; }
 
             // Choose the buffer we’ll analyze/forward (16 kHz mono expected by Vosk)
             const int16_t* data = nullptr;
