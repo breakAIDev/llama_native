@@ -596,7 +596,7 @@ struct VoiceIO {
 #endif
             if (rsbuf.empty()) continue;
             
-            int ns = rsbuf.size() * sizeof(int16_t);
+            int ns = rsbuf.size();
             if (!vad_enabled) {
                 // Old behavior: always stream; push final results when available
                 (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns);
@@ -622,10 +622,10 @@ struct VoiceIO {
                 if (!tmp.empty()) {
                     (void)vosk_recognizer_accept_waveform(vrec, (const char*)tmp.data(), tmp.size() * sizeof(int16_t));
                 }
-                (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns);
+                (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns * sizeof(int16_t));
             } else if (speaking_now) {
                 // In speech: keep feeding
-                (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns);
+                (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns * sizeof(int16_t));
             } else if (was_speaking && !speaking_now) {
                 // End-of-speech: force finalize and emit a single full utterance
                 if (const char* fj = vosk_recognizer_final_result(vrec); fj && fj[0]) {
