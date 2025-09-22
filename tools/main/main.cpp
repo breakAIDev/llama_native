@@ -569,98 +569,98 @@ struct VoiceIO {
     }
 
     // ---------- capture thread ----------
-    void thread_fn() {
-#ifndef HAVE_SPEEXDSP
-        resampler.reset(hw_rate, srate);
-#endif
-        vad.reset(srate);
+//     void thread_fn() {
+// #ifndef HAVE_SPEEXDSP
+//         resampler.reset(hw_rate, srate);
+// #endif
+//         vad.reset(srate);
 
-        std::vector<int16_t> inbuf((size_t)framesPer);
-        std::vector<int16_t> rsbuf; rsbuf.reserve(framesPer * 2);
-        std::vector<int16_t> tmp;
+//         std::vector<int16_t> inbuf((size_t)framesPer);
+//         std::vector<int16_t> rsbuf; rsbuf.reserve(framesPer * 2);
+//         std::vector<int16_t> tmp;
 
-        bool was_speaking = false;
+//         bool was_speaking = false;
 
-        while (running) {
-            PaError err;
-            do {
-                err = Pa_ReadStream(pa_in, inbuf.data(), (unsigned long)inbuf.size());
-            } while (err == paInputOverflowed);
+//         while (running) {
+//             PaError err;
+//             do {
+//                 err = Pa_ReadStream(pa_in, inbuf.data(), (unsigned long)inbuf.size());
+//             } while (err == paInputOverflowed);
             
-            if (err != paNoError) { LOG_INF("[voice] PaError"); Pa_Sleep(2); continue; }
+//             if (err != paNoError) { LOG_INF("[voice] PaError"); Pa_Sleep(2); continue; }
 
-#ifdef HAVE_SPEEXDSP
-            resample_block(chunk.data(), chunk.size(), rsbuf, hw_rate, srate);
-#else
-            resampler.process(chunk.data(), chunk.size(), rsbuf);
-#endif
-            if (rsbuf.empty()) continue;
+// #ifdef HAVE_SPEEXDSP
+//             resample_block(inbuf.data(), inbuf.size(), rsbuf, hw_rate, srate);
+// #else
+//             resampler.process(inbuf.data(), inbuf.size(), rsbuf);
+// #endif
+//             if (rsbuf.empty()) continue;
             
-            int ns = rsbuf.size();
-            if (!vad_enabled) {
-                // Old behavior: always stream; push final results when available
-                (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns);
-                if (const char* rj = vosk_recognizer_result(vrec); rj && rj[0]) {
-                    std::string js(rj);
-                    std::string txt = jget(js, "text");
-                    if (!txt.empty()) {
-                        { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
-                        cv.notify_one();
-                    }
-                }
-                continue;
-            }
+//             int ns = rsbuf.size();
+//             if (!vad_enabled) {
+//                 // Old behavior: always stream; push final results when available
+//                 (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns);
+//                 if (const char* rj = vosk_recognizer_result(vrec); rj && rj[0]) {
+//                     std::string js(rj);
+//                     std::string txt = jget(js, "text");
+//                     if (!txt.empty()) {
+//                         { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
+//                         cv.notify_one();
+//                     }
+//                 }
+//                 continue;
+//             }
 
-            // VAD gating: only stream while speaking, collect one final utterance at end
-            vad.add_preroll(rsbuf, ns);
-            bool speaking_now = vad.update(rsbuf, ns);
+//             // VAD gating: only stream while speaking, collect one final utterance at end
+//             vad.add_preroll(rsbuf, ns);
+//             bool speaking_now = vad.update(rsbuf, ns);
 
-            if (!was_speaking && speaking_now) {
-                // Start-of-speech: feed preroll first so we don’t clip initial words
-                tmp.clear();
-                vad.drain_preroll(tmp);
-                if (!tmp.empty()) {
-                    (void)vosk_recognizer_accept_waveform(vrec, (const char*)tmp.data(), tmp.size() * sizeof(int16_t));
-                }
-                (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns * sizeof(int16_t));
-            } else if (speaking_now) {
-                // In speech: keep feeding
-                (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns * sizeof(int16_t));
-            } else if (was_speaking && !speaking_now) {
-                // End-of-speech: force finalize and emit a single full utterance
-                if (const char* fj = vosk_recognizer_final_result(vrec); fj && fj[0]) {
-                    std::string js(fj);
-                    std::string txt = jget(js, "text");
-                    if (!txt.empty()) {
-                        { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
-                        cv.notify_one();
-                        if (on_final) on_final(txt);
-                    }
-                } else {
-                    // Fallback: try normal result if final is empty
-                    if (const char* rj = vosk_recognizer_result(vrec); rj && rj[0]) {
-                        std::string js(rj);
-                        std::string txt = jget(js, "text");
-                        if (!txt.empty()) {
-                            { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
-                            cv.notify_one();
-                            if (on_final) on_final(txt);
-                        }
-                    }
-                }
-                // Prepare recognizer for the next utterance
-                vosk_recognizer_reset(vrec);
-            }
+//             if (!was_speaking && speaking_now) {
+//                 // Start-of-speech: feed preroll first so we don’t clip initial words
+//                 tmp.clear();
+//                 vad.drain_preroll(tmp);
+//                 if (!tmp.empty()) {
+//                     (void)vosk_recognizer_accept_waveform(vrec, (const char*)tmp.data(), tmp.size() * sizeof(int16_t));
+//                 }
+//                 (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns * sizeof(int16_t));
+//             } else if (speaking_now) {
+//                 // In speech: keep feeding
+//                 (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns * sizeof(int16_t));
+//             } else if (was_speaking && !speaking_now) {
+//                 // End-of-speech: force finalize and emit a single full utterance
+//                 if (const char* fj = vosk_recognizer_final_result(vrec); fj && fj[0]) {
+//                     std::string js(fj);
+//                     std::string txt = jget(js, "text");
+//                     if (!txt.empty()) {
+//                         { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
+//                         cv.notify_one();
+//                         if (on_final) on_final(txt);
+//                     }
+//                 } else {
+//                     // Fallback: try normal result if final is empty
+//                     if (const char* rj = vosk_recognizer_result(vrec); rj && rj[0]) {
+//                         std::string js(rj);
+//                         std::string txt = jget(js, "text");
+//                         if (!txt.empty()) {
+//                             { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
+//                             cv.notify_one();
+//                             if (on_final) on_final(txt);
+//                         }
+//                     }
+//                 }
+//                 // Prepare recognizer for the next utterance
+//                 vosk_recognizer_reset(vrec);
+//             }
 
-            was_speaking = speaking_now;
-        }
+//             was_speaking = speaking_now;
+//         }
 
-        if (pa_in) {
-            Pa_StopStream(pa_in);
-            Pa_CloseStream(pa_in);
-            pa_in = nullptr;
-        }
-    }
+//         if (pa_in) {
+//             Pa_StopStream(pa_in);
+//             Pa_CloseStream(pa_in);
+//             pa_in = nullptr;
+//         }
+//     }
 
     // ==================== Threads ====================
     void capture_thread() {
