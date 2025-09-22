@@ -60,7 +60,9 @@
 #include <vosk_api.h>
 #include <espeak-ng/speak_lib.h>
 
-
+#ifdef HAVE_SPEEXDSP
+    #include <speex/speex_resampler.h>
+#endif
 
 // ---- RAIZE: small helpers for JSON + time + current id ----
 static inline std::string now_iso_utc() {
@@ -215,13 +217,11 @@ struct VoiceIO {
     std::unique_ptr<PcmRing> ring;
 
 #ifdef HAVE_SPEEXDSP
-    #include <speex/speex_resampler.h>
-
     SpeexResamplerState* spx = nullptr;
 
     bool spx_init(int in_rate, int out_rate) {
         int err = 0;
-        spx = speex_resampler_init(1, in_rate, out_rate, SPEEX_RESAMPLER_QUALITY_DEFAULT, &err);
+        spx = speex_resampler_init(1, in_rate, out_rate, 10, &err);
         return spx && err == RESAMPLER_ERR_SUCCESS;
     }
 
@@ -678,7 +678,9 @@ struct VoiceIO {
     void capture_thread() {
         // (optional) bump priority
 #ifdef __linux__
-        sched_param sp{.sched_priority = 12};
+        struct sched_param sp;
+        sp.sched_priority = 12;
+        
         pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
 #endif
         std::vector<int16_t> inbuf((size_t)framesPer);
@@ -736,8 +738,8 @@ struct VoiceIO {
                     std::string js(rj);
                     std::string txt = jget(js, "text");
                     if (!txt.empty()) {
-                        { std::lock_guard<std::mutex> lk(q_mu); q.push(txt); }
-                        q_cv.notify_one();
+                        { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
+                        cv.notify_one();
                         if (on_final) on_final(txt);
                     }
                 }
@@ -762,8 +764,8 @@ struct VoiceIO {
                     std::string js(fj);
                     std::string txt = jget(js, "text");
                     if (!txt.empty()) {
-                        { std::lock_guard<std::mutex> lk(q_mu); q.push(txt); }
-                        q_cv.notify_one();
+                        { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
+                        cv.notify_one();
                         if (on_final) on_final(txt);
                     }
                 } else {
@@ -771,8 +773,8 @@ struct VoiceIO {
                         std::string js(rj);
                         std::string txt = jget(js, "text");
                         if (!txt.empty()) {
-                            { std::lock_guard<std::mutex> lk(q_mu); q.push(txt); }
-                            q_cv.notify_one();
+                            { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
+                            cv.notify_one();
                             if (on_final) on_final(txt);
                         }
                     }
