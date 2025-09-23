@@ -568,101 +568,8 @@ struct VoiceIO {
         }
     }
 
-    // ---------- capture thread ----------
-//     void thread_fn() {
-// #ifndef HAVE_SPEEXDSP
-//         resampler.reset(hw_rate, srate);
-// #endif
-//         vad.reset(srate);
-
-//         std::vector<int16_t> inbuf((size_t)framesPer);
-//         std::vector<int16_t> rsbuf; rsbuf.reserve(framesPer * 2);
-//         std::vector<int16_t> tmp;
-
-//         bool was_speaking = false;
-
-//         while (running) {
-//             PaError err;
-//             do {
-//                 err = Pa_ReadStream(pa_in, inbuf.data(), (unsigned long)inbuf.size());
-//             } while (err == paInputOverflowed);
-            
-//             if (err != paNoError) { LOG_INF("[voice] PaError"); Pa_Sleep(2); continue; }
-
-// #ifdef HAVE_SPEEXDSP
-//             resample_block(inbuf.data(), inbuf.size(), rsbuf, hw_rate, srate);
-// #else
-//             resampler.process(inbuf.data(), inbuf.size(), rsbuf);
-// #endif
-//             if (rsbuf.empty()) continue;
-            
-//             int ns = rsbuf.size();
-//             if (!vad_enabled) {
-//                 // Old behavior: always stream; push final results when available
-//                 (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns);
-//                 if (const char* rj = vosk_recognizer_result(vrec); rj && rj[0]) {
-//                     std::string js(rj);
-//                     std::string txt = jget(js, "text");
-//                     if (!txt.empty()) {
-//                         { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
-//                         cv.notify_one();
-//                     }
-//                 }
-//                 continue;
-//             }
-
-//             // VAD gating: only stream while speaking, collect one final utterance at end
-//             vad.add_preroll(rsbuf, ns);
-//             bool speaking_now = vad.update(rsbuf, ns);
-
-//             if (!was_speaking && speaking_now) {
-//                 // Start-of-speech: feed preroll first so we don’t clip initial words
-//                 tmp.clear();
-//                 vad.drain_preroll(tmp);
-//                 if (!tmp.empty()) {
-//                     (void)vosk_recognizer_accept_waveform(vrec, (const char*)tmp.data(), tmp.size() * sizeof(int16_t));
-//                 }
-//                 (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns * sizeof(int16_t));
-//             } else if (speaking_now) {
-//                 // In speech: keep feeding
-//                 (void)vosk_recognizer_accept_waveform(vrec, (const char*)rsbuf, ns * sizeof(int16_t));
-//             } else if (was_speaking && !speaking_now) {
-//                 // End-of-speech: force finalize and emit a single full utterance
-//                 if (const char* fj = vosk_recognizer_final_result(vrec); fj && fj[0]) {
-//                     std::string js(fj);
-//                     std::string txt = jget(js, "text");
-//                     if (!txt.empty()) {
-//                         { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
-//                         cv.notify_one();
-//                         if (on_final) on_final(txt);
-//                     }
-//                 } else {
-//                     // Fallback: try normal result if final is empty
-//                     if (const char* rj = vosk_recognizer_result(vrec); rj && rj[0]) {
-//                         std::string js(rj);
-//                         std::string txt = jget(js, "text");
-//                         if (!txt.empty()) {
-//                             { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
-//                             cv.notify_one();
-//                             if (on_final) on_final(txt);
-//                         }
-//                     }
-//                 }
-//                 // Prepare recognizer for the next utterance
-//                 vosk_recognizer_reset(vrec);
-//             }
-
-//             was_speaking = speaking_now;
-//         }
-
-//         if (pa_in) {
-//             Pa_StopStream(pa_in);
-//             Pa_CloseStream(pa_in);
-//             pa_in = nullptr;
-//         }
-//     }
-
     // ==================== Threads ====================
+    // ---------- capture thread ----------
     void capture_thread() {
         // (optional) bump priority
 #ifdef __linux__
@@ -693,6 +600,7 @@ struct VoiceIO {
         }
     }
 
+    // ---------- vosk thread ----------
     void stt_thread() {
         // consume from ring, resample to srate (16k), run VAD + Vosk
         std::vector<int16_t> chunk;
@@ -859,14 +767,11 @@ struct VoiceIO {
         running = true;
         cap_th = std::thread(&VoiceIO::capture_thread, this);
         stt_th = std::thread(&VoiceIO::stt_thread, this);
-        // th = std::thread(&VoiceIO::thread_fn, this);
         return true;
     }
 
     void shutdown() {
         running = false;
-
-        // if (th.joinable()) th.join();
 
         if (ring) { ring->cv.notify_all(); }
         if (cap_th.joinable()) cap_th.join();
@@ -1535,6 +1440,7 @@ int main(int argc, char ** argv) {
         embd_inp.push_back(decoder_start_token_id);
     }
 
+    std::string content, buffer, voice;
     while ((n_remain != 0 && !is_antiprompt) || params.interactive) {
         // predict
         if (!embd.empty()) {
@@ -1733,6 +1639,10 @@ int main(int argc, char ** argv) {
 
         // if not currently processing queued inputs;
         if ((int) embd_inp.size() <= n_consumed) {
+            content.clear();
+            buffer.clear();
+            voice.clear();
+
             // check for reverse prompt in the last n_prev tokens
             if (!params.antiprompt.empty()) {
                 const int n_prev = 32;
@@ -1790,7 +1700,7 @@ int main(int argc, char ** argv) {
                         chat_add_and_format("assistant", assistant_ss.str());
                         // Send final event
 #ifdef HAVE_VOICE_IO
-                        std::string content = assistant_ss.str();
+                        content = assistant_ss.str();
                         g_voice.tts_say(content);
                         // // Pull id if set in this scope (best-effort); else empty
                         // /* using global g_ble_current_id */
@@ -1833,21 +1743,20 @@ int main(int argc, char ** argv) {
                     embd_inp.push_back(llama_vocab_bos(vocab));
                 }
 
-                std::string buffer;
 #ifdef HAVE_VOICE_IO
                 // // Prefer external inbox; if none arrives within 50ms, poll voice with timeout.
                 // {
-                //     // std::string ext_id, ext_text;
-                //     // if (g_ext.pop(ext_id, ext_text)) {
-                //     //     buffer = ext_text;
-                //     //     // Store current id in a static so we can mirror it back on final
-                //     //     /* using global g_ble_current_id */
-                //     //     g_ble_current_id = ext_id;
-                //     //     // Inform BLE we accepted the request
-                //     //     if (!g_ble_current_id.empty()) {
-                //     //         g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+g_ble_current_id+"\"}");
-                //     //     }
-                //     // } else {
+                //     std::string ext_id, ext_text;
+                //     if (g_ext.pop(ext_id, ext_text)) {
+                //         buffer = ext_text;
+                //         // Store current id in a static so we can mirror it back on final
+                //         /* using global g_ble_current_id */
+                //         g_ble_current_id = ext_id;
+                //         // Inform BLE we accepted the request
+                //         if (!g_ble_current_id.empty()) {
+                //             g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+g_ble_current_id+"\"}");
+                //         }
+                //     } else {
                 //         // 1) Instant grab if a final utterance was just delivered
                 //         {
                 //             std::lock_guard<std::mutex> lk(voice_cb_mu);
@@ -1857,20 +1766,18 @@ int main(int argc, char ** argv) {
                 //             }
                 //         }
                 //         if (buffer.empty()) {
-                //             std::string voice;
                 //             if (g_voice.try_wait_utt_for(voice, 50)) {
                 //                 buffer = std::move(voice);
                 //             }
                 //         }
-                //     // }
-                // }
-                // if (!buffer.empty()) {
-                //     LOG_INF("%s", buffer.c_str());
-                //     // Ack to BLE if it had an id (since id is only known in g_ext.pop(), we can't retrieve it here; optional)
+                //     }
                 // }
 
                 // block until we get a final utterance from Vosk (after VAD end)
-                buffer = g_voice.wait_utt();
+                if (g_voice.try_wait_utt_for(voice, 50)) {
+                    buffer = std::move(voice);
+                }
+                // buffer = g_voice.wait_utt();
                 LOG_INF("%s", buffer.c_str());
 #else
                 if (!params.input_prefix.empty() && !params.conversation_mode) {
