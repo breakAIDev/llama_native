@@ -142,7 +142,7 @@ struct VoiceIO {
     VoskModel*        vmodel        = nullptr;
     VoskRecognizer*   vrec          = nullptr;
 
-    // std::queue<std::string> q;
+    std::queue<std::string> q;
     std::mutex              mu;
     std::condition_variable cv;
 
@@ -634,7 +634,7 @@ struct VoiceIO {
                     std::string js(rj);
                     std::string txt = jget(js, "text");
                     if (!txt.empty()) {
-                        // { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
+                        { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
                         cv.notify_one();
                         if (on_final) on_final(txt);
                     }
@@ -660,7 +660,7 @@ struct VoiceIO {
                     std::string js(fj);
                     std::string txt = jget(js, "text");
                     if (!txt.empty()) {
-                        // { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
+                        { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
                         cv.notify_one();
                         if (on_final) on_final(txt);
                     }
@@ -669,7 +669,7 @@ struct VoiceIO {
                         std::string js(rj);
                         std::string txt = jget(js, "text");
                         if (!txt.empty()) {
-                            // { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
+                            { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
                             cv.notify_one();
                             if (on_final) on_final(txt);
                         }
@@ -788,23 +788,23 @@ struct VoiceIO {
         Pa_Terminate();
     }
     
-    // std::string wait_utt() {
-    //     std::unique_lock<std::mutex> lk(mu);
-    //     cv.wait(lk, [&]{ return !q.empty(); });
-    //     std::string s = std::move(q.front());
-    //     q.pop();
-    //     return s;
-    // }
+    std::string wait_utt() {
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [&]{ return !q.empty(); });
+        std::string s = std::move(q.front());
+        q.pop();
+        return s;
+    }
 
-    // // New: non-blocking pop with timeout for dual-source input
-    // bool try_wait_utt_for(std::string& out, int timeout_ms) {
-    //     std::unique_lock<std::mutex> lk(mu);
-    //     if (cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&]{ return !q.empty(); })) {
-    //         out = std::move(q.front()); q.pop();
-    //         return true;
-    //     }
-    //     return false;
-    // }
+    // New: non-blocking pop with timeout for dual-source input
+    bool try_wait_utt_for(std::string& out, int timeout_ms) {
+        std::unique_lock<std::mutex> lk(mu);
+        if (cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&]{ return !q.empty(); })) {
+            out = std::move(q.front()); q.pop();
+            return true;
+        }
+        return false;
+    }
 };
 
 static VoiceIO g_voice;
@@ -1756,13 +1756,13 @@ int main(int argc, char ** argv) {
                         }
                     } else {
                         // 1) Instant grab if a final utterance was just delivered
-                        std::lock_guard<std::mutex> lk(voice_cb_mu);
-                        if (!voice_ready.empty()) {
-                            buffer = std::move(voice_ready.front());
-                            voice_ready.pop_front();
+                        {
+                            std::lock_guard<std::mutex> lk(voice_cb_mu);
+                            if (!voice_ready.empty()) {
+                                buffer = std::move(voice_ready.front());
+                                voice_ready.pop_front();
+                            }
                         }
-                        // {
-                        // }
                         // if (buffer.empty()) {
                         //     buffer = g_voice.wait_utt();
                         // }
