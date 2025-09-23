@@ -1702,17 +1702,17 @@ int main(int argc, char ** argv) {
 #ifdef HAVE_VOICE_IO
                         content = assistant_ss.str();
                         g_voice.tts_say(content);
-                        // // Pull id if set in this scope (best-effort); else empty
-                        // /* using global g_ble_current_id */
-                        // std::ostringstream ev;
-                        // // Use UTC time
-                        // std::time_t t = std::time(nullptr);
-                        // char buf[32]; std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
-                        // ev << "{\"type\":\"final\",\"id\":\"" << g_ble_current_id
-                        //    << "\",\"content\":" << json_escape(content)
-                        //    << ",\"ts\":\"" << buf << "\"}";
-                        // g_ext.send_event(ev.str());
-                        // g_ble_current_id.clear();
+                        // Pull id if set in this scope (best-effort); else empty
+                        /* using global g_ble_current_id */
+                        std::ostringstream ev;
+                        // Use UTC time
+                        std::time_t t = std::time(nullptr);
+                        char buf[32]; std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
+                        ev << "{\"type\":\"final\",\"id\":\"" << g_ble_current_id
+                           << "\",\"content\":" << json_escape(content)
+                           << ",\"ts\":\"" << buf << "\"}";
+                        g_ext.send_event(ev.str());
+                        g_ble_current_id.clear();
 #endif
                     }
                     is_interacting = true;
@@ -1744,39 +1744,34 @@ int main(int argc, char ** argv) {
                 }
 
 #ifdef HAVE_VOICE_IO
-                // // Prefer external inbox; if none arrives within 50ms, poll voice with timeout.
-                // {
-                //     std::string ext_id, ext_text;
-                //     if (g_ext.pop(ext_id, ext_text)) {
-                //         buffer = ext_text;
-                //         // Store current id in a static so we can mirror it back on final
-                //         /* using global g_ble_current_id */
-                //         g_ble_current_id = ext_id;
-                //         // Inform BLE we accepted the request
-                //         if (!g_ble_current_id.empty()) {
-                //             g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+g_ble_current_id+"\"}");
-                //         }
-                //     } else {
-                //         // 1) Instant grab if a final utterance was just delivered
-                //         {
-                //             std::lock_guard<std::mutex> lk(voice_cb_mu);
-                //             if (!voice_ready.empty()) {
-                //                 buffer = std::move(voice_ready.front());
-                //                 voice_ready.pop_front();
-                //             }
-                //         }
-                //         if (buffer.empty()) {
-                //             if (g_voice.try_wait_utt_for(voice, 50)) {
-                //                 buffer = std::move(voice);
-                //             }
-                //         }
-                //     }
-                // }
+                // Prefer external inbox; if none arrives within 50ms, poll voice with timeout.
+                {
+                    std::string ext_id, ext_text;
+                    if (g_ext.pop(ext_id, ext_text)) {
+                        buffer = ext_text;
+                        // Store current id in a static so we can mirror it back on final
+                        /* using global g_ble_current_id */
+                        g_ble_current_id = ext_id;
+                        // Inform BLE we accepted the request
+                        if (!g_ble_current_id.empty()) {
+                            g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+g_ble_current_id+"\"}");
+                        }
+                    } else {
+                        // 1) Instant grab if a final utterance was just delivered
+                        {
+                            std::lock_guard<std::mutex> lk(voice_cb_mu);
+                            if (!voice_ready.empty()) {
+                                buffer = std::move(voice_ready.front());
+                                voice_ready.pop_front();
+                            }
+                        }
+                        if (buffer.empty()) {
+                            buffer = g_voice.wait_utt();
+                        }
+                    }
+                }
 
                 // block until we get a final utterance from Vosk (after VAD end)
-                if (g_voice.try_wait_utt_for(voice, 50)) {
-                    buffer = std::move(voice);
-                }
                 // buffer = g_voice.wait_utt();
                 LOG_INF("%s", buffer.c_str());
 #else
