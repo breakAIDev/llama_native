@@ -1756,16 +1756,16 @@ int main(int argc, char ** argv) {
                         }
                     } else {
                         // 1) Instant grab if a final utterance was just delivered
-                        {
-                            std::lock_guard<std::mutex> lk(voice_cb_mu);
-                            if (!voice_ready.empty()) {
-                                buffer = std::move(voice_ready.front());
-                                voice_ready.pop_front();
-                            }
-                        }
-                        // if (buffer.empty()) {
-                        //     buffer = g_voice.wait_utt();
+                        // {
+                        //     std::lock_guard<std::mutex> lk(voice_cb_mu);
+                        //     if (!voice_ready.empty()) {
+                        //         buffer = std::move(voice_ready.front());
+                        //         voice_ready.pop_front();
+                        //     }
                         // }
+                        if (buffer.empty()) {
+                            buffer = g_voice.wait_utt();
+                        }
                     }
                 }
 
