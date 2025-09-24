@@ -146,9 +146,6 @@ struct VoiceIO {
     std::mutex              mu;
     std::condition_variable cv;
 
-    std::function<void(const std::string&)> on_final;
-    void set_on_final(std::function<void(const std::string&)> cb) { on_final = std::move(cb); }
-
     // ==================== lockable PCM ring ====================
     struct PcmRing {
         // stores 16-bit mono samples
@@ -636,7 +633,6 @@ struct VoiceIO {
                     if (!txt.empty()) {
                         { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
                         cv.notify_one();
-                        if (on_final) on_final(txt);
                     }
                 }
                 continue;
@@ -662,7 +658,6 @@ struct VoiceIO {
                     if (!txt.empty()) {
                         { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
                         cv.notify_one();
-                        if (on_final) on_final(txt);
                     }
                 } else {
                     if (const char* rj = vosk_recognizer_result(vrec); rj && rj[0]) {
@@ -671,7 +666,6 @@ struct VoiceIO {
                         if (!txt.empty()) {
                             { std::lock_guard<std::mutex> lk(mu); q.push(txt); }
                             cv.notify_one();
-                            if (on_final) on_final(txt);
                         }
                     }
                 }
@@ -1283,18 +1277,10 @@ int main(int argc, char ** argv) {
 	
     // Init voice I/O (optional)
 #ifdef HAVE_VOICE_IO
-    std::mutex voice_cb_mu;
-    std::deque<std::string> voice_ready;
-
     if (!g_voice.init()) {
         LOG_ERR("[voice] init failed; continuing with keyboard input\n");
     } else {
         g_voice.tts_say("Hello, I'm ready. Please speak.");
-        
-        g_voice.set_on_final([&](const std::string& txt){
-            std::lock_guard<std::mutex> lk(voice_cb_mu);
-            voice_ready.push_back(txt);
-        });
     }
 #endif
 
@@ -1755,14 +1741,6 @@ int main(int argc, char ** argv) {
                             g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+g_ble_current_id+"\"}");
                         }
                     } else {
-                        // 1) Instant grab if a final utterance was just delivered
-                        // {
-                        //     std::lock_guard<std::mutex> lk(voice_cb_mu);
-                        //     if (!voice_ready.empty()) {
-                        //         buffer = std::move(voice_ready.front());
-                        //         voice_ready.pop_front();
-                        //     }
-                        // }
                         if (buffer.empty()) {
                             buffer = g_voice.wait_utt();
                         }
@@ -1770,7 +1748,6 @@ int main(int argc, char ** argv) {
                 }
 
                 // block until we get a final utterance from Vosk (after VAD end)
-                // buffer = g_voice.wait_utt();
                 LOG_INF("%s", buffer.c_str());
 #else
                 if (!params.input_prefix.empty() && !params.conversation_mode) {
