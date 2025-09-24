@@ -102,6 +102,7 @@ static inline std::string json_escape(const std::string& in) {
 
 // Single global to carry BLE message id across the turn
 static thread_local std::string g_ble_current_id;
+static thread_local std::string g_ble_current_session_id;
 
 #ifndef VOSK_DEFAULT_MODEL_PATH
     // #define VOSK_DEFAULT_MODEL_PATH "/etc/models/vosk-model-en-us-0.22-lgraph.zip"
@@ -795,12 +796,20 @@ static VoiceIO g_voice;
 
 // ===== RAIZE Unix-socket bridge for external app text =====
 struct ExtInbox {
+    struct InMsg {
+        std::string type;       // "msg" | "stop" | "config" | "legacy"
+        std::string id;
+        std::string content;    // text fed to LLM
+        std::string sessionId;  // for routing replies on app side
+        std::string raw;        // raw json (optional)
+    };
+
     std::string in_path  = "/run/raize_llm_in.sock";   // Python -> C++
     std::string out_path = "/run/raize_llm_out.sock";  // C++ -> Python
     int         in_srv_fd = -1;
     std::thread in_th;
     std::mutex  mu;
-    std::deque<std::pair<std::string,std::string>> q; // (id,text)
+    std::deque<InMsg> q;
 
     static int make_server(const std::string& path) {
         ::unlink(path.c_str());
@@ -830,7 +839,7 @@ struct ExtInbox {
             int cfd = ::accept(in_srv_fd, nullptr, nullptr);
             if (cfd < 0) { std::this_thread::sleep_for(std::chrono::milliseconds(100)); continue; }
             std::string buf;
-            char tmp[1024];
+            char tmp[2048];
             while (true) {
                 ssize_t n = ::read(cfd, tmp, sizeof(tmp));
                 if (n <= 0) break;
@@ -839,12 +848,49 @@ struct ExtInbox {
                 while ((p = buf.find('\n')) != std::string::npos) {
                     std::string line = buf.substr(0, p);
                     buf.erase(0, p+1);
-                    // Expect minimal JSON: {"id":"...", "text":"..."}
-                    auto id = VoiceIO::jget(line, "id");
+                    if (line.empty()) continue;
+
+                    // Minimal JSON extraction (string-based)
+                    InMsg im; im.raw = line;
+                    std::string t  = VoiceIO::jget(line, "type");
+                    std::string id = VoiceIO::jget(line, "id");
+
+                    if (t == "msg") {
+                        im.type      = "msg";
+                        im.id        = id;
+                        im.content   = VoiceIO::jget(line, "content");
+                        im.sessionId = VoiceIO::jget(line, "sessionId");
+                        if (!im.content.empty()) {
+                            std::lock_guard<std::mutex> lk(mu);
+                            q.emplace_back(std::move(im));
+                        }
+                        continue;
+                    }
+
+                    if (t == "stop") {
+                        im.type = "stop";
+                        im.id   = id;
+                        std::lock_guard<std::mutex> lk(mu);
+                        q.emplace_back(std::move(im));
+                        continue;
+                    }
+
+                    if (t == "config") {
+                        // Optional: handled inside main loop if you want live tweaks.
+                        im.type = "config";
+                        std::lock_guard<std::mutex> lk(mu);
+                        q.emplace_back(std::move(im));
+                        continue;
+                    }
+
+                    // Legacy: {"id":"...","text":"..."}
                     auto tx = VoiceIO::jget(line, "text");
                     if (!tx.empty()) {
+                        im.type    = "legacy";
+                        im.id      = id;
+                        im.content = tx;
                         std::lock_guard<std::mutex> lk(mu);
-                        q.emplace_back(id, tx);
+                        q.emplace_back(std::move(im));
                     }
                 }
             }
@@ -852,15 +898,15 @@ struct ExtInbox {
         }
     }
 
-    bool pop(std::string& id, std::string& text) {
+    bool pop(InMsg& out) {
         std::lock_guard<std::mutex> lk(mu);
         if (q.empty()) return false;
-        id = q.front().first; text = q.front().second; q.pop_front();
+        out = std::move(q.front());
+        q.pop_front();
         return true;
     }
 
     void send_event(const std::string& json_line) {
-        // connect out_path and send a line
         int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) return;
         struct sockaddr_un addr{};
@@ -1676,17 +1722,24 @@ int main(int argc, char ** argv) {
 #ifdef HAVE_VOICE_IO
                         content = assistant_ss.str();
                         g_voice.tts_say(content);
-                        // Pull id if set in this scope (best-effort); else empty
-                        /* using global g_ble_current_id */
+
                         std::ostringstream ev;
-                        // Use UTC time
-                        std::time_t t = std::time(nullptr);
-                        char buf[32]; std::strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", std::gmtime(&t));
-                        ev << "{\"type\":\"final\",\"id\":\"" << g_ble_current_id
-                           << "\",\"content\":" << json_escape(content)
-                           << ",\"ts\":\"" << buf << "\"}";
+                        const long ts_epoch = (long) std::time(nullptr);
+                        ev << "{"
+                        << "\"type\":\"msg\""
+                        << ",\"actor\":\"assistant\""
+                        << ",\"id\":\"" << g_ble_current_id << "\""
+                        << ",\"sessionId\":" << (g_ble_current_session_id.empty() ? "null" : json_escape(g_ble_current_session_id))
+                        << ",\"content\":" << json_escape(content)
+                        << ",\"outputType\":\"text\""
+                        << ",\"ts\":" << ts_epoch
+                        << "}";
+
                         g_ext.send_event(ev.str());
+
+                        // clear for next turn
                         g_ble_current_id.clear();
+                        g_ble_current_session_id.clear();
 #endif
                     }
                     is_interacting = true;
@@ -1720,19 +1773,28 @@ int main(int argc, char ** argv) {
 #ifdef HAVE_VOICE_IO
                 // Prefer external inbox; if none arrives within 50ms, poll voice with timeout.
                 {
-                    std::string ext_id, ext_text;
-                    if (g_ext.pop(ext_id, ext_text)) {
-                        buffer = ext_text;
-                        // Store current id in a static so we can mirror it back on final
-                        /* using global g_ble_current_id */
-                        g_ble_current_id = ext_id;
-                        // Inform BLE we accepted the request
-                        if (!g_ble_current_id.empty()) {
-                            g_ext.send_event(std::string("{\"type\":\"ack\",\"id\":\"")+g_ble_current_id+"\"}");
+                    ExtInbox::InMsg in;
+                    if (g_ext.pop(in)) {
+                        if (in.type == "stop") {
+                            // Gracefully interject current generation
+                            is_interacting  = true;
+                            need_insert_eot = true;
+                            // no buffer injection; just continue loop
+                        } else if (in.type == "config") {
+                            // Optional: parse in.raw and tweak g_voice.* live if desired.
+                            // (safe to ignore if you don't need live tweaking)
+                        } else {
+                            // "msg", or "legacy" → feed to LLM
+                            buffer = std::move(in.content);
+                            g_ble_current_id          = std::move(in.id);
+                            g_ble_current_session_id  = std::move(in.sessionId);
                         }
                     } else {
+                        // No BLE text arrived; fall back to voice
                         if (buffer.empty()) {
                             buffer = g_voice.wait_utt();
+                            g_ble_current_id.clear();
+                            g_ble_current_session_id.clear();
                         }
                     }
                 }
