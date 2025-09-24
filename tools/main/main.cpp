@@ -789,16 +789,6 @@ struct VoiceIO {
         q.pop();
         return s;
     }
-
-    // New: non-blocking pop with timeout for dual-source input
-    bool try_wait_utt_for(std::string& out, int timeout_ms) {
-        std::unique_lock<std::mutex> lk(mu);
-        if (cv.wait_for(lk, std::chrono::milliseconds(timeout_ms), [&]{ return !q.empty(); })) {
-            out = std::move(q.front()); q.pop();
-            return true;
-        }
-        return false;
-    }
 };
 
 static VoiceIO g_voice;
