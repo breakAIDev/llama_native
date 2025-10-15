@@ -100,6 +100,16 @@ static inline std::string json_escape(const std::string& in) {
     return out;
 }
 
+static inline void replace_all(std::string &s, const std::string &from, const std::string &to = "")
+{
+    if (from.empty()) return;
+    size_t start = 0;
+    while ((start = s.find(from, start)) != std::string::npos) {
+        s.replace(start, from.length(), to);
+        // no start++ so we handle back-to-back matches
+    }
+}
+
 // Single global to carry BLE message id across the turn
 static thread_local std::string g_ble_current_id;
 static thread_local std::string g_ble_current_session_id;
@@ -1721,6 +1731,12 @@ int main(int argc, char ** argv) {
                         // Send final event
 #ifdef HAVE_VOICE_IO
                         content = assistant_ss.str();
+                        replace_all(content, "\n<think>");
+                        replace_all(content, "\n</think>");
+                        // int i = 0;
+                        // while(content[i] == "\n") {
+                        //     i++;
+                        // }
                         g_voice.tts_say(content);
 
                         std::ostringstream ev;
@@ -1736,10 +1752,6 @@ int main(int argc, char ** argv) {
                         << "}";
 
                         g_ext.send_event(ev.str());
-
-                        // clear for next turn
-                        g_ble_current_id.clear();
-                        g_ble_current_session_id.clear();
 #endif
                     }
                     is_interacting = true;
@@ -1836,6 +1848,21 @@ int main(int argc, char ** argv) {
                 } else {
                     // Add tokens to embd only if the input buffer is non-empty
                     // append input suffix if any
+#ifdef HAVE_VOICE_IO
+                    std::ostringstream ev;
+                    const long ts_epoch = (long) std::time(nullptr);
+                    ev << "{"
+                    << "\"type\":\"msg\""
+                    << ",\"actor\":\"user\""
+                    << ",\"id\":\"" << g_ble_current_id << "\""
+                    << ",\"sessionId\":" << (g_ble_current_session_id.empty() ? "null" : json_escape(g_ble_current_session_id))
+                    << ",\"content\":" << json_escape(buffer)
+                    << ",\"outputType\":\"text\""
+                    << ",\"ts\":" << ts_epoch
+                    << "}";
+
+                    g_ext.send_event(ev.str());
+#endif
                     buffer += "/no_think\n";
 
                     if (!params.input_suffix.empty() && !params.conversation_mode) {
