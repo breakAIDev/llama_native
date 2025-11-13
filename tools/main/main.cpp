@@ -115,8 +115,8 @@ static thread_local std::string g_ble_current_id;
 static thread_local std::string g_ble_current_session_id;
 
 #ifndef VOSK_DEFAULT_MODEL_PATH
-    // #define VOSK_DEFAULT_MODEL_PATH "/etc/models/vosk-model-en-us-0.22-lgraph.zip"
-    #define VOSK_DEFAULT_MODEL_PATH "/etc/models/vosk-model-small-en-us-0.15.zip"
+    // #define VOSK_DEFAULT_MODEL_PATH "/etc/mytelligent/models/vosk-model-en-us-0.22-lgraph.zip"
+    #define VOSK_DEFAULT_MODEL_PATH "/etc/mytelligent/models/vosk-model-small-en-us-0.15.zip"
 #endif
 
 struct VoiceIO {
@@ -332,7 +332,7 @@ struct VoiceIO {
         if (slash != std::string::npos) base = base.substr(slash + 1);
         if (ends_with(base, ".zip"))    base = base.substr(0, base.size() - 4);
 
-        const std::string root   = env_or("VOSK_MODEL_UNZIP_DIR", "/etc/models/vosk");
+        const std::string root   = env_or("VOSK_MODEL_UNZIP_DIR", "/etc/mytelligent/models/vosk");
         const fs::path    outDir = fs::path(root) / base;
 
         std::error_code ec;
